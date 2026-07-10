@@ -129,6 +129,13 @@ class EvaluationConfig:
     
     headless: bool = True
     visualize: bool = False
+    # Passed through to the IsaacLab AppLauncher in the OpenPI client.
+    # This controls Kit active_gpu/physics_gpu, which may otherwise default to physical GPU0.
+    sim_device: str = ""
+    # Keep false by default so Isaac/Kit does not initialize all visible GPUs during single-env eval.
+    sim_multi_gpu: bool = False
+    # Extra Kit args for renderer selection, e.g. "--/renderer/activeGpu=8".
+    sim_kit_args: str = ""
     randomize_light: bool = False
     debug_mode: int = 0
     # Optional: override OpenPI client's debug output root (e.g., for debug_mode=6 captures).
@@ -154,18 +161,21 @@ class EvaluationConfig:
     require_hdf5: bool = False
 
 
+def effective_max_inference_steps(
+    config: EvaluationConfig, task_suite: str
+) -> int:
+    """Return the inference horizon actually passed to an evaluation client."""
+    if task_suite == "libero_10":
+        return 50
+    if task_suite in ("libero_goal", "libero_spatial", "libero_object"):
+        return 30
+    return config.max_inference_steps
+
+
 def build_command(config: EvaluationConfig, task_suite: str, task_id: int) -> list[str]:
     """Build command line arguments for subprocess."""
     python_script = config.openpi_script if config.policy_model == "openpi" else config.gr00t_script
-    # Per-suite inference step policy (user request):
-    # - libero_10:      max_inference_steps = 80
-    # - libero_goal/spatial/object: max_inference_steps = 50
-    if task_suite == "libero_10":
-        max_inference_steps = 50
-    elif task_suite in ("libero_goal", "libero_spatial", "libero_object"):
-        max_inference_steps = 30
-    else:
-        max_inference_steps = config.max_inference_steps
+    max_inference_steps = effective_max_inference_steps(config, task_suite)
     
     cmd = [
         sys.executable, python_script,
@@ -204,6 +214,14 @@ def build_command(config: EvaluationConfig, task_suite: str, task_id: int) -> li
 
     if config.headless and not config.visualize:
         cmd.append("--headless")
+    if config.sim_device:
+        cmd.extend(["--sim_device", str(config.sim_device)])
+    if config.sim_multi_gpu:
+        cmd.append("--sim_multi_gpu")
+    if config.sim_kit_args:
+        # Use equals form because Kit args commonly start with "--" and tyro would otherwise
+        # parse the value as a new option in the child OpenPI client.
+        cmd.append(f"--sim_kit_args={config.sim_kit_args}")
     
     if config.debug_mode > 0:
         cmd.extend(["--debug_mode", str(config.debug_mode)])
@@ -316,13 +334,7 @@ def run_single_evaluation(
     print(f"Language Instruction: {language_instruction}")
     print(f"{'='*80}")
 
-    # Keep the effective max_inference_steps in results for traceability.
-    if task_suite == "libero_10":
-        effective_max_inference_steps = 80
-    elif task_suite in ("libero_goal", "libero_spatial", "libero_object"):
-        effective_max_inference_steps = 50
-    else:
-        effective_max_inference_steps = config.max_inference_steps
+    max_inference_steps = effective_max_inference_steps(config, task_suite)
     cmd = build_command(config, task_suite, task_id)
     
     env = os.environ.copy()
@@ -386,10 +398,10 @@ def run_single_evaluation(
             and (total_experiments is not None)
             and (total_experiments == config.num_total_experiments)
         )
-        status = "completed" if parsed_full_eval else ("completed" if process.returncode == 0 else "failed")
+        status = "completed" if parsed_full_eval else "failed"
         
         print(f"\n{'='*80}")
-        print(f"TASK COMPLETED: {task_suite} - Task {task_id}")
+        print(f"TASK {status.upper()}: {task_suite} - Task {task_id}")
         print(f"{'='*80}")
         if success_rate is not None:
             print(f"✓ Success Rate: {success_rate:.2f}% ({successful_experiments}/{total_experiments} experiments)")
@@ -406,7 +418,7 @@ def run_single_evaluation(
             "success_rate": success_rate,
             "successful_experiments": successful_experiments,
             "total_experiments": total_experiments,
-            "max_inference_steps": effective_max_inference_steps,
+            "max_inference_steps": max_inference_steps,
             "avg_squeeze_pred": avg_squeeze_pred,
             "avg_squeeze_meas": avg_squeeze_meas,
             "task_squeeze_max_mean": task_squeeze_max_mean,
@@ -432,7 +444,7 @@ def run_single_evaluation(
             "success_rate": None,
             "successful_experiments": None,
             "total_experiments": None,
-            "max_inference_steps": effective_max_inference_steps,
+            "max_inference_steps": max_inference_steps,
             "return_code": -1,
             "execution_time": 3600,
             "status": "timeout",
@@ -450,7 +462,7 @@ def run_single_evaluation(
             "success_rate": None,
             "successful_experiments": None,
             "total_experiments": None,
-            "max_inference_steps": effective_max_inference_steps,
+            "max_inference_steps": max_inference_steps,
             "return_code": -1,
             "execution_time": 0,
             "status": "error",
@@ -473,15 +485,11 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "task_environment": config.task if config.task else "auto",
             "num_total_experiments": config.num_total_experiments,
             "num_success_steps": config.num_success_steps,
-            # NOTE: max_inference_steps is enforced per task_suite when evaluating LIBERO suites:
-            #   - libero_10: 80
-            #   - libero_goal/libero_spatial/libero_object: 50
-            # Other suites fall back to config.max_inference_steps.
             "max_inference_steps_policy": {
-                "libero_10": 80,
-                "libero_goal": 50,
-                "libero_spatial": 50,
-                "libero_object": 50,
+                "libero_10": effective_max_inference_steps(config, "libero_10"),
+                "libero_goal": effective_max_inference_steps(config, "libero_goal"),
+                "libero_spatial": effective_max_inference_steps(config, "libero_spatial"),
+                "libero_object": effective_max_inference_steps(config, "libero_object"),
                 "default": config.max_inference_steps,
             },
             "timestamp": datetime.now().isoformat(),
@@ -499,6 +507,7 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "success_rate": result["success_rate"],
             "successful_experiments": result["successful_experiments"],
             "total_experiments": result["total_experiments"],
+            "max_inference_steps": result.get("max_inference_steps"),
             "execution_time": result["execution_time"],
             "status": result["status"],
             # Hybrid 下可选：成功 experiment 的平均挤压力（可能为 None）
@@ -539,7 +548,7 @@ def save_success_rates_txt(results: list[dict], output_file: Path, config: Evalu
             f.write(f"  abs7d: {config.abs7d}\n")
         f.write(f"  Experiments per task: {config.num_total_experiments}\n")
         f.write(f"  Success steps required: {config.num_success_steps}\n")
-        f.write(f"  Max inference steps: {config.max_inference_steps}\n")
+        f.write(f"  Default max inference steps: {config.max_inference_steps}\n")
         f.write(f"  Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("\n" + "=" * 60 + "\n\n")
 

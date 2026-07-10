@@ -223,6 +223,13 @@ class OpenpiClientArguments(ClosedLoopArguments):
     # Default to headless to avoid X11/GLX BadMatch crashes on servers or misconfigured displays.
     # If you want a GUI window, pass: --no-headless
     headless: bool = True
+    # IsaacLab/Kit device. Unlike CUDA_VISIBLE_DEVICES, AppLauncher's active_gpu/physics_gpu
+    # can be interpreted as a physical GPU id by the renderer, so keep this explicit.
+    sim_device: str = os.environ.get("ISAACLAB_DEVICE", "cuda:0")
+    # Keep single-GPU app launch by default. Multi-GPU mode can probe or initialize extra GPUs.
+    sim_multi_gpu: bool = False
+    # Extra Kit args, for example: --/renderer/activeGpu=8
+    sim_kit_args: str = os.environ.get("ISAACLAB_KIT_ARGS", "")
     seed: int = 11
     randomize_light: bool = False
     # debug_mode:
@@ -388,7 +395,15 @@ else:
     print(f"Using HDF5 folder from command line (--hdf5.folder): {args.hdf5_folder}")
 
 # Launch the simulator FIRST before importing tac_manip modules
-app_launcher = AppLauncher(headless=args.headless, enable_cameras=True, num_envs=1)
+print(f"Using IsaacLab simulation device: {args.sim_device}")
+app_launcher = AppLauncher(
+    headless=args.headless,
+    enable_cameras=True,
+    num_envs=1,
+    device=args.sim_device,
+    multi_gpu=args.sim_multi_gpu,
+    kit_args=args.sim_kit_args,
+)
 simulation_app = app_launcher.app
 
 # add configs for dataset generation for various task_suite and task_id,

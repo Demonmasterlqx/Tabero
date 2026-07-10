@@ -1,4 +1,6 @@
 import ast
+import io
+import json
 import sys
 from pathlib import Path
 
@@ -49,3 +51,94 @@ def test_openpi_osc_actions_are_sent_as_7d_actions():
     osc_branch = source[osc_branch_start:next_branch_start]
     assert "action_chunk[:, :7]" in osc_branch
     assert "axisangle2quat" not in osc_branch
+
+
+def test_openpi_sim_launcher_args_are_passed_to_client_command():
+    config = rte.EvaluationConfig(
+        policy_model="openpi",
+        sim_device="cuda:0",
+        sim_multi_gpu=True,
+        sim_kit_args="--/renderer/activeGpu=8",
+    )
+
+    cmd = rte.build_command(config, "libero_object", 0)
+
+    assert "--sim_device" in cmd
+    assert cmd[cmd.index("--sim_device") + 1] == "cuda:0"
+    assert "--sim_multi_gpu" in cmd
+    assert "--sim_kit_args" not in cmd
+    assert "--sim_kit_args=--/renderer/activeGpu=8" in cmd
+
+
+def test_openpi_client_passes_sim_launcher_args_to_app_launcher():
+    source = (ROOT / "benchmarks/openpi/openpi_inference_client.py").read_text()
+    module = ast.parse(source)
+    fields = set()
+
+    for node in ast.walk(module):
+        if isinstance(node, ast.ClassDef) and node.name == "OpenpiClientArguments":
+            for item in node.body:
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    fields.add(item.target.id)
+
+    assert "sim_device" in fields
+    assert "sim_multi_gpu" in fields
+    assert "sim_kit_args" in fields
+
+    assert "multi_gpu=args.sim_multi_gpu" in source
+    assert "kit_args=args.sim_kit_args" in source
+
+
+def test_libero_horizon_policy_is_consistent_in_command_and_json(tmp_path):
+    config = rte.EvaluationConfig(policy_model="openpi", max_inference_steps=80)
+
+    assert rte.effective_max_inference_steps(config, "libero_10") == 50
+    assert rte.effective_max_inference_steps(config, "libero_object") == 30
+
+    command = rte.build_command(config, "libero_object", 0)
+    assert command[command.index("--max_inference_steps") + 1] == "30"
+
+    output_path = tmp_path / "result.json"
+    result = {
+        "task_suite": "libero_object",
+        "task_id": 0,
+        "task_name": "pick_up_object",
+        "language_instruction": "pick up the object",
+        "success_rate": 50.0,
+        "successful_experiments": 1,
+        "total_experiments": 2,
+        "max_inference_steps": 30,
+        "execution_time": 1.0,
+        "status": "completed",
+    }
+    rte.save_success_rates_json([result], output_path, config)
+    saved = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert saved["metadata"]["max_inference_steps_policy"]["libero_10"] == 50
+    assert saved["metadata"]["max_inference_steps_policy"]["libero_object"] == 30
+    assert saved["results"]["libero_object_task0"]["max_inference_steps"] == 30
+
+
+def test_zero_exit_without_complete_metrics_is_failed(monkeypatch, capsys):
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.StringIO("CUDA error: invalid device ordinal\n")
+            self.returncode = 0
+
+        def wait(self, timeout):
+            assert timeout == 3600
+
+    monkeypatch.setattr(rte.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    config = rte.EvaluationConfig(policy_model="openpi", num_total_experiments=1)
+
+    result = rte.run_single_evaluation(
+        config,
+        task_suite="libero_object",
+        task_id=0,
+        workspace_root=ROOT,
+    )
+
+    assert result["return_code"] == 0
+    assert result["success_rate"] is None
+    assert result["status"] == "failed"
+    assert "TASK FAILED: libero_object - Task 0" in capsys.readouterr().out
