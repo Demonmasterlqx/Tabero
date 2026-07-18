@@ -477,6 +477,13 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
+    if config.prompt_adverbs:
+        prompt_mode = "adverb_set"
+    elif config.prompt_adverb:
+        prompt_mode = "single_adverb"
+    else:
+        prompt_mode = "plain"
+
     output_data = {
         "metadata": {
             "policy_model": config.policy_model,
@@ -485,6 +492,10 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "task_environment": config.task if config.task else "auto",
             "num_total_experiments": config.num_total_experiments,
             "num_success_steps": config.num_success_steps,
+            "prompt_mode": prompt_mode,
+            "prompt_adverb": config.prompt_adverb,
+            "prompt_adverbs": list(config.prompt_adverbs),
+            "prompt_seed": config.prompt_seed,
             "max_inference_steps_policy": {
                 "libero_10": effective_max_inference_steps(config, "libero_10"),
                 "libero_goal": effective_max_inference_steps(config, "libero_goal"),

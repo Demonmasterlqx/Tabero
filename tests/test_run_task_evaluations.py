@@ -119,6 +119,41 @@ def test_libero_horizon_policy_is_consistent_in_command_and_json(tmp_path):
     assert saved["results"]["libero_object_task0"]["max_inference_steps"] == 30
 
 
+def test_plain_prompt_evaluation_omits_adverbs_and_records_metadata(tmp_path):
+    config = rte.EvaluationConfig(
+        policy_model="openpi",
+        prompt_adverb="",
+        prompt_adverbs=(),
+        prompt_seed=0,
+    )
+
+    command = rte.build_command(config, "libero_object", 6)
+
+    assert "--prompt_adverb" not in command
+    assert "--prompt_adverbs" not in command
+
+    output_path = tmp_path / "result.json"
+    result = {
+        "task_suite": "libero_object",
+        "task_id": 6,
+        "task_name": "pick_up_the_butter_and_place_it_in_the_basket",
+        "language_instruction": "pick up the butter and place it in the basket",
+        "success_rate": 70.0,
+        "successful_experiments": 7,
+        "total_experiments": 10,
+        "max_inference_steps": 30,
+        "execution_time": 1.0,
+        "status": "completed",
+    }
+    rte.save_success_rates_json([result], output_path, config)
+    metadata = json.loads(output_path.read_text(encoding="utf-8"))["metadata"]
+
+    assert metadata["prompt_mode"] == "plain"
+    assert metadata["prompt_adverb"] == ""
+    assert metadata["prompt_adverbs"] == []
+    assert metadata["prompt_seed"] == 0
+
+
 def test_zero_exit_without_complete_metrics_is_failed(monkeypatch, capsys):
     class FakeProcess:
         def __init__(self):
