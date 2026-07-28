@@ -1,87 +1,138 @@
 import ast
+import importlib
+import sys
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 CLIENT_PATH = ROOT / "benchmarks/openpi/openpi_inference_client.py"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
-def _load_client_helpers(*names: str) -> dict:
-    source = CLIENT_PATH.read_text(encoding="utf-8")
-    module = ast.parse(source)
-    selected = [
-        node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names
-    ]
-    namespace = {"cv2": cv2, "np": np}
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(CLIENT_PATH), "exec"), namespace)
-    return namespace
+class FakeClient:
+    def __init__(self, events=None):
+        self.payload = None
+        self.response = {"actions": np.zeros((2, 7), dtype=np.float32)}
+        self.events = events
+
+    def infer(self, payload):
+        if self.events is not None:
+            self.events.append("infer")
+        self.payload = payload
+        return self.response
 
 
-def test_dsrl_raw_image_opt_in_adds_raw_256_image_and_bytes_alias():
-    helpers = _load_client_helpers("_add_dsrl_raw_image", "_add_bytes_key_aliases")
-    raw_image = np.arange(256 * 256 * 3, dtype=np.uint8).reshape(256, 256, 3)
-    resized_image = np.zeros((224, 224, 3), dtype=np.uint8)
-    payload = {"image": resized_image, b"image": resized_image}
-
-    helpers["_add_dsrl_raw_image"](payload, raw_image, enabled=True)
-    helpers["_add_bytes_key_aliases"](payload, ("dsrl_raw_image",))
-
-    assert payload["image"].shape == (224, 224, 3)
-    assert payload["dsrl_raw_image"] is raw_image
-    assert payload[b"dsrl_raw_image"] is raw_image
+def _infer_openpi_step():
+    module = importlib.import_module("benchmarks.openpi.openpi_payload")
+    return module.infer_openpi_step
 
 
-def test_dsrl_raw_image_capture_selects_agentview_and_downsamples_official_camera_frame():
-    capture = _load_client_helpers("_capture_dsrl_raw_image")["_capture_dsrl_raw_image"]
-    wrist_frame = np.full((1, 512, 512, 3), 7, dtype=np.uint8)
-    agentview_frame = np.full((1, 512, 512, 3), 13, dtype=np.uint8)
-
-    assert capture("eye_in_hand_cam", wrist_frame, enabled=True) is None
-    captured = capture("agentview_cam", agentview_frame, enabled=True)
-
-    assert isinstance(captured, np.ndarray)
-    assert captured.dtype == np.uint8
-    assert captured.shape == (256, 256, 3)
-    assert np.all(captured == 13)
+def _base_payload():
+    state = np.arange(7, dtype=np.float32)
+    return {
+        "state": state,
+        "observation/state": state,
+        "prompt": "pick up the object",
+    }
 
 
-def test_dsrl_raw_image_capture_is_inert_when_disabled():
-    capture = _load_client_helpers("_capture_dsrl_raw_image")["_capture_dsrl_raw_image"]
+def test_production_step_sends_224_images_and_opt_in_raw_agentview_to_same_infer_payload():
+    infer_openpi_step = _infer_openpi_step()
+    events = []
+    client = FakeClient(events)
+    wrist = np.full((1, 512, 512, 3), 7, dtype=np.uint8)
+    agentview = np.full((1, 512, 512, 3), 13, dtype=np.uint8)
+    base_payload = _base_payload()
 
-    assert capture("agentview_cam", None, enabled=False) is None
+    def save_debug_frames(_resized_frames):
+        events.append("debug")
+
+    response, resized_frames = infer_openpi_step(
+        client,
+        camera_frames=(("eye_in_hand_cam", wrist), ("agentview_cam", agentview)),
+        target_image_size=(224, 224, 3),
+        base_payload=base_payload,
+        send_dsrl_raw_image=True,
+        before_infer=save_debug_frames,
+    )
+
+    assert response is client.response
+    assert client.payload is base_payload
+    assert events == ["debug", "infer"]
+    assert client.payload["image"].shape == (224, 224, 3)
+    assert client.payload["wrist_image"].shape == (224, 224, 3)
+    assert client.payload["dsrl_raw_image"].shape == (256, 256, 3)
+    assert client.payload["dsrl_raw_image"].dtype == np.uint8
+    assert np.all(client.payload["dsrl_raw_image"] == 13)
+    assert client.payload[b"dsrl_raw_image"] is client.payload["dsrl_raw_image"]
+    assert client.payload[b"image"] is client.payload["image"]
+    assert [frame.shape for frame in resized_frames] == [(1, 224, 224, 3), (1, 224, 224, 3)]
 
 
-def test_dsrl_raw_image_default_does_not_change_payload_or_validate_raw_image():
-    add_dsrl_raw_image = _load_client_helpers("_add_dsrl_raw_image")["_add_dsrl_raw_image"]
-    resized_image = np.zeros((224, 224, 3), dtype=np.uint8)
-    payload = {"image": resized_image, b"image": resized_image}
-    original_keys = set(payload)
+def test_production_step_default_payload_has_no_dsrl_raw_image():
+    infer_openpi_step = _infer_openpi_step()
+    client = FakeClient()
+    agentview = np.full((1, 512, 512, 3), 13, dtype=np.uint8)
+    wrist = np.full((1, 512, 512, 3), 7, dtype=np.uint8)
 
-    add_dsrl_raw_image(payload, None, enabled=False)
+    base_payload = _base_payload()
+    infer_openpi_step(
+        client,
+        camera_frames=(("agentview_cam", agentview), ("eye_in_hand_cam", wrist)),
+        target_image_size=(224, 224, 3),
+        base_payload=base_payload,
+        send_dsrl_raw_image=False,
+    )
 
-    assert set(payload) == original_keys
-    assert "dsrl_raw_image" not in payload
-    assert b"dsrl_raw_image" not in payload
+    assert client.payload is base_payload
+    string_keys = {key for key in client.payload if isinstance(key, str)}
+    assert string_keys == {
+        "image",
+        "wrist_image",
+        "state",
+        "prompt",
+        "observation/image",
+        "observation/wrist_image",
+        "observation/state",
+    }
+    assert {key for key in client.payload if isinstance(key, bytes)} == {key.encode("utf-8") for key in string_keys}
+    assert client.payload["image"].shape == (224, 224, 3)
+    assert client.payload["image"].dtype == np.uint8
+    assert np.all(client.payload["image"] == 13)
+    assert np.all(client.payload["wrist_image"] == 7)
+    assert client.payload["observation/image"] is client.payload["image"]
+    assert client.payload[b"observation/wrist_image"] is client.payload["wrist_image"]
+    assert "dsrl_raw_image" not in client.payload
+    assert b"dsrl_raw_image" not in client.payload
 
 
 @pytest.mark.parametrize(
-    ("raw_image", "message"),
+    ("agentview", "message"),
     [
         (None, "numpy.ndarray"),
-        (np.zeros((256, 256, 3), dtype=np.float32), "dtype uint8"),
-        (np.zeros((224, 224, 3), dtype=np.uint8), r"shape \(256, 256, 3\)"),
-        (np.zeros((1, 256, 256, 3), dtype=np.uint8), r"shape \(256, 256, 3\)"),
+        (np.zeros((1, 256, 256, 3), dtype=np.float32), "dtype uint8"),
+        (np.zeros((1, 224, 224, 3), dtype=np.uint8), r"shape \(256, 256, 3\)"),
     ],
 )
-def test_dsrl_raw_image_opt_in_strictly_validates_raw_image(raw_image, message):
-    add_dsrl_raw_image = _load_client_helpers("_add_dsrl_raw_image")["_add_dsrl_raw_image"]
+def test_production_step_opt_in_strictly_validates_raw_agentview(agentview, message):
+    infer_openpi_step = _infer_openpi_step()
+    client = FakeClient()
+    camera_frames = [] if agentview is None else [("agentview_cam", agentview)]
+    camera_frames.append(("eye_in_hand_cam", np.zeros((1, 512, 512, 3), dtype=np.uint8)))
 
     with pytest.raises((TypeError, ValueError), match=message):
-        add_dsrl_raw_image({}, raw_image, enabled=True)
+        infer_openpi_step(
+            client,
+            camera_frames=camera_frames,
+            target_image_size=(224, 224, 3),
+            base_payload=_base_payload(),
+            send_dsrl_raw_image=True,
+        )
+
+    assert client.payload is None
 
 
 def test_openpi_client_declares_dsrl_raw_image_opt_in_default_false():
