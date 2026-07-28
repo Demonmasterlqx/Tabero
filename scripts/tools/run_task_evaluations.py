@@ -116,6 +116,7 @@ class EvaluationConfig:
     
     camera_names: tuple[str, ...] = ("agentview_cam", "eye_in_hand_cam")
     target_image_size: tuple[int, int, int] = (224, 224, 3)
+    send_dsrl_raw_image: bool = False
     num_steps_wait: int = 5
     
     task_suites: tuple[str, ...] = ()
@@ -199,6 +200,8 @@ def build_command(config: EvaluationConfig, task_suite: str, task_id: int) -> li
         ])
         if config.abs7d:
             cmd.append("--abs7d")
+        if config.send_dsrl_raw_image:
+            cmd.append("--send-dsrl-raw-image")
         if config.task:
             cmd.extend(["--task", config.task])
         # Optional prompt rewrite knobs

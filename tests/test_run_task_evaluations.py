@@ -70,6 +70,18 @@ def test_openpi_sim_launcher_args_are_passed_to_client_command():
     assert "--sim_kit_args=--/renderer/activeGpu=8" in cmd
 
 
+def test_dsrl_raw_image_flag_is_opt_in_for_openpi_client_command():
+    default_cmd = rte.build_command(rte.EvaluationConfig(policy_model="openpi"), "libero_object", 0)
+    enabled_cmd = rte.build_command(
+        rte.EvaluationConfig(policy_model="openpi", send_dsrl_raw_image=True),
+        "libero_object",
+        0,
+    )
+
+    assert "--send-dsrl-raw-image" not in default_cmd
+    assert enabled_cmd.count("--send-dsrl-raw-image") == 1
+
+
 def test_openpi_client_passes_sim_launcher_args_to_app_launcher():
     source = (ROOT / "benchmarks/openpi/openpi_inference_client.py").read_text()
     module = ast.parse(source)

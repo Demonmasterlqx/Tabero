@@ -218,6 +218,7 @@ class OpenpiClientArguments(ClosedLoopArguments):
     server_host: str = "127.0.1.1"
     server_port: int = 8000
     target_image_size: tuple[int, int, int] = (224, 224, 3)
+    send_dsrl_raw_image: bool = False
 
     # Simulator specific parameters
     # Default to headless to avoid X11/GLX BadMatch crashes on servers or misconfigured displays.
@@ -350,6 +351,44 @@ def _add_bytes_key_aliases(d: dict, keys: tuple[str, ...]) -> None:
     for k in keys:
         if k in d and isinstance(k, str):
             d[k.encode("utf-8")] = d[k]
+
+
+def _capture_dsrl_raw_image(camera_name: str, frame, *, enabled: bool):
+    """Capture the named agentview before the existing 224 image preprocessing."""
+    if not enabled or camera_name != "agentview_cam":
+        return None
+    raw_batch = frame.detach().cpu().numpy() if hasattr(frame, "detach") else frame
+    if isinstance(raw_batch, np.ndarray) and raw_batch.shape[:1] == (1,):
+        raw_image = raw_batch[0]
+    else:
+        raw_image = raw_batch
+    # Tabero's official Libero cameras render at 512 square. Produce the DSRL-native
+    # 256 frame here, independently of the existing OpenPI 224 preprocessing below.
+    if isinstance(raw_image, np.ndarray) and raw_image.shape == (512, 512, 3):
+        raw_image = cv2.resize(raw_image, (256, 256), interpolation=cv2.INTER_AREA)
+    return raw_image
+
+
+def _add_dsrl_raw_image(d: dict, raw_image, *, enabled: bool) -> None:
+    """Validate and add the opt-in DSRL agentview image to an inference payload."""
+    if not enabled:
+        return
+    if not isinstance(raw_image, np.ndarray):
+        raise TypeError(
+            "send_dsrl_raw_image requires the raw agentview image to be a numpy.ndarray, "
+            f"but got {type(raw_image).__name__}."
+        )
+    if raw_image.dtype != np.uint8:
+        raise TypeError(
+            "send_dsrl_raw_image requires the raw agentview image to have dtype uint8, "
+            f"but got {raw_image.dtype}."
+        )
+    if raw_image.shape != (256, 256, 3):
+        raise ValueError(
+            "send_dsrl_raw_image requires the raw agentview image to have shape (256, 256, 3), "
+            f"but got {raw_image.shape}."
+        )
+    d["dsrl_raw_image"] = raw_image
 
 
 # Set USE_RELATIVE_MODE environment variable for DiffIK controller
@@ -766,10 +805,16 @@ def run_closed_loop_policy(  # noqa: C901
             for action_idx in range(args.max_inference_steps):
                 # Get camera images from live cameras
                 rgbs = []
-                for cam_name in list(args.camera_names):
+                dsrl_raw_image = None
+                for cam_name in args.camera_names:
                     cam_id = cam_name.split("_")[0]
                     cam = env.unwrapped.scene[cam_name]
                     rgb = cam.data.output["rgb"]
+                    captured_dsrl_image = _capture_dsrl_raw_image(
+                        cam_name, rgb, enabled=args.send_dsrl_raw_image
+                    )
+                    if captured_dsrl_image is not None:
+                        dsrl_raw_image = captured_dsrl_image
                     rgb = resize_frames_with_padding(rgb, args.target_image_size, bgr_conversion=False, pad_img=True)
                     rgbs.append(rgb)
 
@@ -842,6 +887,7 @@ def run_closed_loop_policy(  # noqa: C901
                     "observation/state": eef_pose_states,
                     "prompt": exp_prompt,
                 }
+                _add_dsrl_raw_image(element, dsrl_raw_image, enabled=args.send_dsrl_raw_image)
                 if args.control_mode == "hybrid":
                     gf = tactile_buf.get_force_history()
                     if gf is not None:
@@ -875,6 +921,7 @@ def run_closed_loop_policy(  # noqa: C901
                         "tactile_image",
                         "tactile_gripper_force",
                         "tactile_marker_motion",
+                        "dsrl_raw_image",
                         "observation/image",
                         "observation/wrist_image",
                         "observation/state",
