@@ -4,12 +4,58 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.tools import run_task_evaluations as rte
+
+
+def _episode_record(index: int, *, success: bool, env_steps: int, chunks: int) -> dict:
+    return {
+        "experiment_index": index,
+        "hdf5_episode_index": index + 10,
+        "success": success,
+        "end_reason": "success" if success else "max_inference_steps",
+        "env_steps": env_steps,
+        "inference_chunks": chunks,
+        "force_status": "complete",
+        "force_samples": {
+            "predicted_action_steps": env_steps,
+            "measured_force_steps": env_steps,
+            "squeeze_pred_steps": env_steps,
+            "squeeze_meas_steps": env_steps,
+            "ap_pred_steps": env_steps,
+            "ap_meas_steps": env_steps,
+            "predicted_contact_steps": env_steps,
+            "measured_contact_steps": env_steps,
+            "predicted_contact_ratio": 1.0,
+            "measured_contact_ratio": 1.0,
+            "coverage_ratio": 1.0,
+        },
+        "squeeze_avg_pred": 1.0,
+        "squeeze_avg_meas": 2.0,
+        "squeeze_max_pred": 3.0,
+        "squeeze_max_meas": 4.0,
+        "ap_avg_pred": 5.0,
+        "ap_avg_meas": 6.0,
+        "ap_max_pred": 7.0,
+        "ap_max_meas": 8.0,
+        "trace_status": "disabled",
+        "trace_rows": 0,
+        "trace_error": None,
+    }
+
+
+def test_episode_metrics_parser_reports_malformed_structured_lines():
+    payload, warning = rte.parse_episode_metrics_line("[Episode-Metrics] {bad json}\n")
+
+    assert payload is None
+    assert warning is not None
+    assert "invalid Episode-Metrics JSON" in warning
 
 
 def test_libero_path_under_tabero_checkout_does_not_auto_enable_tabero_subset():
@@ -188,4 +234,195 @@ def test_zero_exit_without_complete_metrics_is_failed(monkeypatch, capsys):
     assert result["return_code"] == 0
     assert result["success_rate"] is None
     assert result["status"] == "failed"
+    assert result["metrics_status"] == "partial"
+    assert result["episodes"] == []
     assert "TASK FAILED: libero_object - Task 0" in capsys.readouterr().out
+
+
+def test_nonzero_exit_with_complete_success_and_episode_metrics_is_completed(monkeypatch):
+    records = [
+        _episode_record(0, success=True, env_steps=11, chunks=2),
+        _episode_record(1, success=False, env_steps=20, chunks=2),
+    ]
+    stdout = "".join(
+        f"[Episode-Metrics] {json.dumps(record)}\n" for record in records
+    ) + (
+        "Evaluation Results:\n"
+        "Total experiments: 2\n"
+        "Successful experiments: 1\n"
+        "Success rate: 50.00%\n"
+        "[Hybrid] Task avg squeeze_pred=1.0000, squeeze_meas=2.0000 over 1 successes\n"
+        "[Hybrid-Metrics] Task contact_metrics squeeze_max_mean=3.0000, "
+        "app_max_mean=7.0000, app_mean_mean=5.0000, squeeze_max_meas_mean=4.0000, "
+        "ap_max_meas_mean=8.0000, ap_mean_meas_mean=6.0000 over 1 successes\n"
+    )
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = 17
+            self.stdout = io.StringIO(stdout)
+
+        def wait(self, timeout):
+            assert timeout == 3600
+
+    monkeypatch.setattr(rte.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    config = rte.EvaluationConfig(
+        policy_model="openpi",
+        control_mode="tactile",
+        num_total_experiments=2,
+    )
+
+    result = rte.run_single_evaluation(config, "libero_object", 1, ROOT)
+
+    assert result["return_code"] == 17
+    assert result["status"] == "completed"
+    assert result["metrics_status"] == "complete"
+    assert [episode["success"] for episode in result["episodes"]] == [True, False]
+    assert result["step_statistics"]["all"]["env_steps_total"] == 31
+    assert result["force_metric_episode_counts"] == {
+        key: 1 for key in rte.FORCE_METRIC_KEYS
+    }
+
+
+def test_duplicate_missing_and_partial_force_records_do_not_change_success_status(monkeypatch):
+    first = _episode_record(0, success=True, env_steps=10, chunks=1)
+    duplicate = _episode_record(0, success=False, env_steps=10, chunks=1)
+    duplicate["force_status"] = "partial"
+    stdout = (
+        f"[Episode-Metrics] {json.dumps(first)}\n"
+        f"[Episode-Metrics] {json.dumps(duplicate)}\n"
+        "Total experiments: 2\n"
+        "Successful experiments: 1\n"
+        "Success rate: 50.00%\n"
+    )
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = io.StringIO(stdout)
+
+        def wait(self, timeout):
+            pass
+
+    monkeypatch.setattr(rte.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    config = rte.EvaluationConfig(num_total_experiments=2)
+
+    result = rte.run_single_evaluation(config, "libero_object", 0, ROOT)
+
+    assert result["status"] == "completed"
+    assert result["metrics_status"] == "partial"
+    assert any("duplicate experiment_index" in warning for warning in result["metrics_warnings"])
+    assert any("partial force coverage" in warning for warning in result["metrics_warnings"])
+
+
+def test_step_trace_cli_resolution_command_and_validation(tmp_path):
+    config = rte.EvaluationConfig(
+        policy_model="openpi",
+        record_step_traces=True,
+        num_total_experiments=1,
+        output_dir=tmp_path,
+    )
+    root = rte.resolve_step_trace_root(
+        config,
+        model_name="openpi_tactile",
+        timestamp="20260801_010203",
+    )
+    assert root == tmp_path / "step_traces_openpi_tactile_20260801_010203"
+
+    trace_path = root / "libero_object_task1.jsonl"
+    command = rte.build_command(config, "libero_object", 1, step_trace_path=trace_path)
+    assert command[command.index("--step_trace_path") + 1] == str(trace_path)
+
+    episode = _episode_record(0, success=True, env_steps=2, chunks=1)
+    episode["trace_status"] = "complete"
+    episode["trace_rows"] = 2
+    trace_path.parent.mkdir(parents=True)
+    rows = []
+    for step in range(2):
+        rows.append(
+            {
+                "experiment_index": 0,
+                "env_step_index": step,
+                "inference_chunk_index": 0,
+                "action_in_chunk_index": step,
+                "fL_pred_local": [0.0, 0.0, 1.0],
+                "fR_pred_local": [0.0, 0.0, -1.0],
+                "fL_meas_local": [0.0, 0.0, 1.0],
+                "fR_meas_local": [0.0, 0.0, -1.0],
+                "squeeze_pred": 2.0,
+                "squeeze_meas": 2.0,
+                "ap_pred": 0.0,
+                "ap_meas": 0.0,
+                "predicted_contact": True,
+                "measured_contact": True,
+            }
+        )
+    trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    descriptor, warnings = rte.validate_step_trace(
+        trace_path,
+        [episode],
+        enabled=True,
+        output_dir=tmp_path,
+        replan_steps=10,
+    )
+    assert warnings == []
+    assert descriptor == {
+        "enabled": True,
+        "path": "step_traces_openpi_tactile_20260801_010203/libero_object_task1.jsonl",
+        "rows": 2,
+        "status": "complete",
+    }
+    _, artifacts, _ = rte.collect_episode_metric_artifacts(
+        config,
+        [episode],
+        [],
+        trace_path,
+        max_inference_steps=30,
+        successful_experiments=1,
+    )
+    assert artifacts["metrics_status"] == "complete"
+
+
+def test_step_trace_dir_without_record_flag_is_rejected(tmp_path):
+    config = rte.EvaluationConfig(step_trace_dir=tmp_path / "traces")
+
+    with pytest.raises(ValueError, match="requires --record-step-traces"):
+        rte.resolve_step_trace_root(config, model_name="openpi_tactile", timestamp="stamp")
+
+
+def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
+    episode = _episode_record(0, success=False, env_steps=10, chunks=1)
+    episode["squeeze_avg_pred"] = None
+    config = rte.EvaluationConfig(num_total_experiments=1, replan_steps=10)
+    result = {
+        "task_suite": "libero_object",
+        "task_id": 1,
+        "task_name": "task",
+        "language_instruction": "instruction",
+        "success_rate": 0.0,
+        "successful_experiments": 0,
+        "total_experiments": 1,
+        "max_inference_steps": 30,
+        "execution_time": 1.0,
+        "status": "completed",
+        "metrics_status": "complete",
+        "metrics_warnings": [],
+        "step_statistics": rte.summarize_step_statistics([episode]),
+        "force_metric_episode_counts": {key: 0 for key in rte.FORCE_METRIC_KEYS},
+        "episodes": [episode],
+        "step_trace": {"enabled": False, "path": None, "rows": 0, "status": "disabled"},
+    }
+    json_path = tmp_path / "result.json"
+    txt_path = tmp_path / "result.txt"
+
+    rte.save_success_rates_json([result], json_path, config)
+    rte.save_success_rates_txt([result], txt_path, config)
+
+    task = json.loads(json_path.read_text())["results"]["libero_object_task1"]
+    text = txt_path.read_text()
+    assert task["metrics_status"] == "complete"
+    assert task["episodes"][0]["env_steps"] == 10
+    assert "Per-experiment step and force coverage:" in text
+    assert "Per-experiment force metrics:" in text
+    assert "N/A" in text

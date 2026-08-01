@@ -26,7 +26,7 @@ Keep input directories and output directories separate.
 
 - `replay_demos_with_camera.py` / `replay_demos.py`: if you pass multiple `--task_suite` values, or pass `--task_suite` without `--task_id`, the script launches child processes for each `(suite, task_id)` pair. This avoids repeatedly rebuilding Isaac/Kit environments in one process.
 - `run_data_evaluations.py`: launches `replay_demos.py` for each task, parses stdout, and aggregates success/metric results until `max_episodes` is reached.
-- `run_task_evaluations.py`: launches the OpenPI or other policy inference client for each task and parses stdout for success rate and force metrics.
+- `run_task_evaluations.py`: launches the OpenPI or other policy inference client for each task and parses stdout for success rate, per-experiment step counts, and force metrics.
 
 ### 3. Optional Libero Light Randomization
 
@@ -225,7 +225,7 @@ python scripts/tools/run_data_evaluations.py \
 
 ### `run_task_evaluations.py`
 
-Runs policy inference evaluation for each task, usually through the OpenPI client, then parses success rate and Hybrid force metrics from stdout.
+Runs policy inference evaluation for each task, usually through the OpenPI client, then parses success rate plus structured per-experiment step and force metrics from stdout. On the OpenPI path, per-experiment summaries are always enabled and include both successful and failed experiments; the optional step-trace interface is OpenPI-only.
 
 Short command:
 
@@ -251,8 +251,23 @@ python scripts/tools/run_task_evaluations.py \
   --debug_mode 0 \
   --output_dir ./evaluation_results \
   --output_format both \
+  --record-step-traces \
+  --step-trace-dir ./evaluation_results/my_step_traces \
   --headless
 ```
+
+`--record-step-traces` is optional and disabled by default. When it is enabled without `--step-trace-dir`, traces are written under
+`<output_dir>/step_traces_<model>_<timestamp>/<suite>_task<ID>.jsonl`. Passing `--step-trace-dir` without enabling traces is rejected. This force-only JSONL is independent of `debug_mode=6` and never stores images.
+
+Step semantics:
+
+- `env_steps` counts only completed policy-control `env.step()` calls; reset and setup are excluded.
+- `inference_chunks` increments once for each valid policy request. Therefore `env_steps <= inference_chunks * replan_steps`.
+- Each JSONL row represents one `env.step()` and includes experiment/step/chunk indices, predicted and measured left/right local 3D finger forces, squeeze/ap values, and contact flags.
+
+The JSON result keeps the existing task-level force fields unchanged and adds `metrics_status`, `metrics_warnings`, `step_statistics`, `force_metric_episode_counts`, `episodes`, and `step_trace`. `status` remains the success-rate status; incomplete metric records only change `metrics_status` to `partial`. The TXT result retains the task summary and adds per-experiment step/coverage and eight-force-metric tables, using `N/A` for unavailable values.
+
+The eight force metrics remain success-only at task level. Each episode records the same fields for success or failure: `squeeze_avg_pred`, `squeeze_avg_meas`, `squeeze_max_pred`, `squeeze_max_meas`, `ap_avg_pred`, `ap_avg_meas`, `ap_max_pred`, and `ap_max_meas`. The `max` metrics are the mean of the largest 5% of nonzero-force frames, not a single-frame maximum. Tactile/hybrid expects full predicted and measured coverage; binary may omit predicted force; diffik/osc reports force as `not_applicable` while still recording steps.
 
 ### `raw_data_retention_analysis.py`
 

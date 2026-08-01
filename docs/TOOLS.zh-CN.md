@@ -34,7 +34,7 @@
 
 - `replay_demos_with_camera.py` / `replay_demos.py`：当你传了多个 `--task_suite`，或只传 `--task_suite` 不传 `--task_id` 时，会**通过子进程**逐个 (suite, task_id) 调用自己，避免单进程反复重建 Isaac/Kit 导致不稳定。
 - `run_data_evaluations.py`：会对每个 task 反复调用 `replay_demos.py`（子进程），解析 stdout 统计 success/metrics，直到累计 episode 达到 `max_episodes`。
-- `run_task_evaluations.py`：会对每个 task 调用 OpenPI（或其它 policy）推理脚本（子进程），解析 stdout 得到成功率与力学指标。
+- `run_task_evaluations.py`：会对每个 task 调用 OpenPI（或其它 policy）推理脚本（子进程），解析 stdout 得到成功率、逐 experiment step 计数与力学指标。
 
 ### 3）可选 Libero 光照随机化
 
@@ -245,7 +245,7 @@ python scripts/tools/run_data_evaluations.py \
 
 ### `run_task_evaluations.py`（策略推理评估：OpenPI / 其它）
 
-- **作用**：对每个 task 启动推理脚本（默认 OpenPI client），统计成功率，并解析 Hybrid 相关力学指标。
+- **作用**：对每个 task 启动推理脚本（默认 OpenPI client），统计成功率，并解析逐 experiment 的 step 与力学指标；OpenPI 路径会记录成功和失败 experiment，逐步轨迹接口也仅覆盖 OpenPI。
 - **逻辑**：
   - 子进程调用 `benchmarks/openpi/openpi_inference_client.py`
   - 从 stdout 解析 “Success rate / Hybrid metrics”
@@ -274,8 +274,23 @@ python scripts/tools/run_task_evaluations.py \
   --debug_mode 0 \
   --output_dir ./evaluation_results \
   --output_format both \
+  --record-step-traces \
+  --step-trace-dir ./evaluation_results/my_step_traces \
   --headless
 ```
+
+`--record-step-traces` 是可选开关，默认关闭。启用但没有指定 `--step-trace-dir` 时，轨迹默认写入
+`<output_dir>/step_traces_<model>_<timestamp>/<suite>_task<ID>.jsonl`。只指定目录但未启用开关会直接报错。该 JSONL 仅记录力与索引，不保存图像，也不依赖 `debug_mode=6`。
+
+Step 语义：
+
+- `env_steps` 只统计策略控制阶段实际完成的 `env.step()` 调用，不包含 reset/setup。
+- `inference_chunks` 每次有效策略请求加一，因此应满足 `env_steps <= inference_chunks * replan_steps`。
+- JSONL 每行对应一个 `env.step()`，包含 experiment/step/chunk 索引、预测与实测左右指局部 3D 力、squeeze/ap 及接触标记。
+
+JSON 保留已有 task 级力字段，并新增 `metrics_status`、`metrics_warnings`、`step_statistics`、`force_metric_episode_counts`、`episodes` 和 `step_trace`。`status` 仍只表示成功率解析状态；指标不完整只会把 `metrics_status` 设为 `partial`。TXT 保留原 task 汇总，同时新增逐 experiment 的 step/覆盖率表和八项力指标表；缺失值统一写 `N/A`。
+
+八项 task 级力指标仍只汇总成功 experiment。每个成功或失败 episode 都记录 `squeeze_avg_pred`、`squeeze_avg_meas`、`squeeze_max_pred`、`squeeze_max_meas`、`ap_avg_pred`、`ap_avg_meas`、`ap_max_pred`、`ap_max_meas`。其中 `max` 仍是非零力帧中最大 Top 5% 的均值，不是单帧最大值。tactile/hybrid 要求预测与实测完整覆盖；binary 允许预测力缺失；diffik/osc 的力状态是 `not_applicable`，但仍记录 step。
 
 ---
 

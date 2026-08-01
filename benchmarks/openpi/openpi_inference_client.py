@@ -35,11 +35,12 @@ from benchmarks.common.closedloop_policy_inference import (
     ClosedLoopArguments,
     ClosedLoopPolicyInference,
 )
+from benchmarks.common.episode_metrics import (
+    aggregate_success_force_metrics,
+    summarize_episode_force_metrics,
+)
 from benchmarks.common.metrics import (
-    compute_contact_force_metrics_from_13d,
-    compute_contact_force_metrics_from_lr_forces,
     compute_contact_force_series_from_lr_forces,
-    compute_topk_mean,
 )
 from benchmarks.openpi.openpi_payload import infer_openpi_step
 
@@ -70,6 +71,37 @@ def _to_uint8_rgb(img) -> np.ndarray:
     elif img.dtype != np.uint8:
         img = img.astype(np.uint8)
     return img
+
+
+def _vector3_or_none(value) -> list[float] | None:
+    """Return one JSON-safe 3D vector, or None when unavailable."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        vector = np.asarray(value, dtype=np.float32).reshape(3)
+    except (TypeError, ValueError):
+        return None
+    if not np.all(np.isfinite(vector)):
+        return None
+    return [float(component) for component in vector]
+
+
+def _finite_float_or_none(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) else None
+
+
+def _contact_or_none(left: list[float] | None, right: list[float] | None) -> bool | None:
+    if left is None or right is None:
+        return None
+    return bool(np.linalg.norm(left) + np.linalg.norm(right) > 1e-6)
 
 
 def _pad_history_front(items: list[np.ndarray], target_len: int) -> list[np.ndarray]:
@@ -251,6 +283,8 @@ class OpenpiClientArguments(ClosedLoopArguments):
     # Default to a repo-local folder for full debug records (images + tactile + forces).
     # You can override via CLI: --debug_path /abs/path/to/dir
     debug_path: str = str(project_root / "full_records")
+    # Optional force-only JSONL. This is independent from debug_mode=6 image capture.
+    step_trace_path: Optional[Path] = None
 
     camera_names: tuple[str, ...] = ("agentview_cam", "eye_in_hand_cam")
     tactile_sensor_names: tuple[str, str] = ("gsmini_left", "gsmini_right")
@@ -581,26 +615,19 @@ def run_closed_loop_policy(  # noqa: C901
             "with num_envs == 1. Skipping visualizer initialization."
         )
 
+    step_trace_fh = None
+    step_trace_open_error: str | None = None
+    if args.step_trace_path is not None:
+        try:
+            trace_path = Path(args.step_trace_path)
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            step_trace_fh = open(trace_path, "x", encoding="utf-8", buffering=1)
+        except Exception as exc:
+            step_trace_open_error = str(exc)
+            print(f"[Step-Trace] Failed to create {args.step_trace_path}: {exc}")
+
     successful_experiments = 0
-
-    # 统计：跨所有成功 experiment 的夹爪挤压力均值（仅在 Hybrid 环境中有效）
-    succ_squeeze_pred_sum = 0.0
-    succ_squeeze_meas_sum = 0.0
-    succ_squeeze_count = 0
-
-    # 统计：跨所有成功 experiment 的挤压力 / 加持力 metrics（仅在 Hybrid + 13D action 时有效）
-    succ_metrics_count = 0
-    succ_squeeze_max_sum = 0.0
-    succ_app_max_sum = 0.0
-    succ_app_mean_sum = 0.0
-
-    # 统计：跨所有成功 experiment 的「实测」Top5% 最大挤压力 / 加持力及平均加持力
-    succ_squeeze_max_meas_sum = 0.0
-    succ_squeeze_max_meas_count = 0
-    succ_ap_mean_meas_sum = 0.0
-    succ_ap_mean_meas_count = 0
-    succ_ap_max_meas_sum = 0.0
-    succ_ap_max_meas_count = 0
+    episode_metrics_records: list[dict] = []
 
     # Find HDF5 file based on task_suite and task_id
     hdf5_file = find_hdf5_file(args.hdf5_folder, args.task_suite, args.task_id)
@@ -652,23 +679,22 @@ def run_closed_loop_policy(  # noqa: C901
             success_step_count = 0
             experiment_success = False
             total_steps_taken = 0
-
-            # 当前 experiment 的挤压力统计（均值）
-            exp_fsq_pred_sum = 0.0
-            exp_fsq_meas_sum = 0.0
-            exp_fsq_count = 0
+            inference_chunks_taken = 0
+            end_reason = "max_inference_steps"
+            dataset_episode_index: int | None = None
 
             # 当前 experiment 的逐帧挤压力 / 加持力记录（用于 Top5% 统计）
             exp_fsq_pred_values: list[float] = []
             exp_fsq_meas_values: list[float] = []
             exp_ap_pred_values: list[float] = []
             exp_ap_meas_values: list[float] = []
-            # binary 模式：额外缓存逐步左右指 3D 力序列（用于严格复用 metrics.py 的统计定义）
+            # 缓存逐步左右指实测 3D 力，用于接触步数与覆盖率统计。
             exp_fL_meas_values: list[np.ndarray] = []
             exp_fR_meas_values: list[np.ndarray] = []
 
-            # 当前 experiment 的 Hybrid 13D 动作缓存（仅在 control_mode == "hybrid" 时使用）
+            # 当前 experiment 的 Hybrid 13D 动作缓存。
             exp_actions_13d: list[torch.Tensor] = []
+            exp_step_trace_rows: list[dict] = []
 
             # debug_mode=6: per-experiment capture directories + force log (JSONL)
             mode6_exp_dir: Path | None = None
@@ -699,6 +725,7 @@ def run_closed_loop_policy(  # noqa: C901
             if episode_indices_to_use:
                 # Use episode index from the list (cycling through all episodes)
                 episode_index = episode_indices_to_use[exp_idx % len(episode_indices_to_use)]
+                dataset_episode_index = int(episode_index)
                 episode_data = dataset_file_handler.load_episode(episode_map[episode_index], env.unwrapped.device)
 
                 if "initial_state" in episode_data.data:
@@ -951,6 +978,7 @@ def run_closed_loop_policy(  # noqa: C901
 
                 # Execute inference actions
                 action = inference_actions
+                inference_chunks_taken += 1
 
                 # 仅在 debug_mode 1/2/3 时保存动作
                 if args.debug_mode in (1, 2, 3):
@@ -962,11 +990,29 @@ def run_closed_loop_policy(  # noqa: C901
                 for i in range(num_actions_to_execute):
                     obs, reward, terminated, truncated, info = env.step(action[i].reshape([1, -1]))
 
+                    step_fL_pred = None
+                    step_fR_pred = None
+                    step_fL_meas = None
+                    step_fR_meas = None
+                    step_squeeze_pred = None
+                    step_squeeze_meas = None
+                    step_ap_pred = None
+                    step_ap_meas = None
+
                     # 若为 Hybrid 控制模式，则缓存 13D 动作以便后续计算 metrics
                     if args.control_mode in ("hybrid", "tactile"):
                         try:
                             if action[i].shape[-1] == 13:
                                 exp_actions_13d.append(action[i].detach().cpu())
+                                action_np = action[i].detach().cpu().numpy().astype(np.float32)
+                                step_fL_pred = _vector3_or_none(action_np[7:10])
+                                step_fR_pred = _vector3_or_none(action_np[10:13])
+                                pred_series = compute_contact_force_series_from_lr_forces(
+                                    fL=np.asarray([step_fL_pred], dtype=np.float32),
+                                    fR=np.asarray([step_fR_pred], dtype=np.float32),
+                                )
+                                step_squeeze_pred = _finite_float_or_none(pred_series.squeeze[0])
+                                step_ap_pred = _finite_float_or_none(pred_series.external_norm[0])
                         except Exception:
                             pass
 
@@ -978,24 +1024,37 @@ def run_closed_loop_policy(  # noqa: C901
                         debug = None
                     if debug:
                         try:
-                            f_sq_pred = float(debug.get("f_sq_pred", 0.0))
-                            f_sq_meas = float(debug.get("f_sq_meas", 0.0))
-                            exp_fsq_pred_sum += f_sq_pred
-                            exp_fsq_meas_sum += f_sq_meas
-                            exp_fsq_count += 1
-                            exp_fsq_pred_values.append(f_sq_pred)
-                            exp_fsq_meas_values.append(f_sq_meas)
+                            if debug.get("f_sq_pred") is not None:
+                                step_squeeze_pred = _finite_float_or_none(debug["f_sq_pred"])
+                                if step_squeeze_pred is not None:
+                                    exp_fsq_pred_values.append(step_squeeze_pred)
+                            if debug.get("f_sq_meas") is not None:
+                                step_squeeze_meas = _finite_float_or_none(debug["f_sq_meas"])
+                                if step_squeeze_meas is not None:
+                                    exp_fsq_meas_values.append(step_squeeze_meas)
 
                             # 加持力模长（在 base frame 下），用于 Ap 相关统计
                             ap_pred = debug.get("F_app_norm_pred", None)
                             ap_meas = debug.get("F_app_norm_meas", None)
                             try:
                                 if ap_pred is not None:
-                                    exp_ap_pred_values.append(float(ap_pred))
+                                    step_ap_pred = _finite_float_or_none(ap_pred)
+                                    if step_ap_pred is not None:
+                                        exp_ap_pred_values.append(step_ap_pred)
                                 if ap_meas is not None:
-                                    exp_ap_meas_values.append(float(ap_meas))
+                                    step_ap_meas = _finite_float_or_none(ap_meas)
+                                    if step_ap_meas is not None:
+                                        exp_ap_meas_values.append(step_ap_meas)
                             except Exception:
                                 pass
+
+                            step_fL_pred = _vector3_or_none(debug.get("fL_pred_local")) or step_fL_pred
+                            step_fR_pred = _vector3_or_none(debug.get("fR_pred_local")) or step_fR_pred
+                            step_fL_meas = _vector3_or_none(debug.get("fL_meas_local"))
+                            step_fR_meas = _vector3_or_none(debug.get("fR_meas_local"))
+                            if step_fL_meas is not None and step_fR_meas is not None:
+                                exp_fL_meas_values.append(np.asarray(step_fL_meas, dtype=np.float32))
+                                exp_fR_meas_values.append(np.asarray(step_fR_meas, dtype=np.float32))
                         except Exception:
                             pass
                     elif args.control_mode == "binary":
@@ -1018,41 +1077,73 @@ def run_closed_loop_policy(  # noqa: C901
                                 fL=np.asarray([f_left], dtype=np.float32),
                                 fR=np.asarray([f_right], dtype=np.float32),
                             )
-                            squeeze_meas = float(series.squeeze[0])
-                            ap_meas = float(series.external_norm[0])
+                            squeeze_meas = _finite_float_or_none(series.squeeze[0])
+                            ap_meas = _finite_float_or_none(series.external_norm[0])
 
                             # pred placeholders (0.0) for log/regex compatibility
                             squeeze_pred = 0.0
                             ap_pred = 0.0
 
-                            exp_fsq_pred_sum += squeeze_pred
-                            exp_fsq_meas_sum += squeeze_meas
-                            exp_fsq_count += 1
                             exp_fsq_pred_values.append(squeeze_pred)
-                            exp_fsq_meas_values.append(squeeze_meas)
+                            if squeeze_meas is not None:
+                                exp_fsq_meas_values.append(squeeze_meas)
 
                             exp_ap_pred_values.append(ap_pred)
-                            exp_ap_meas_values.append(ap_meas)
+                            if ap_meas is not None:
+                                exp_ap_meas_values.append(ap_meas)
+
+                            step_squeeze_pred = squeeze_pred
+                            step_squeeze_meas = squeeze_meas
+                            step_ap_pred = ap_pred
+                            step_ap_meas = ap_meas
+                            step_fL_meas = _vector3_or_none(f_left)
+                            step_fR_meas = _vector3_or_none(f_right)
 
                             # Keep raw 3D forces for strict per-episode metrics aggregation.
-                            exp_fL_meas_values.append(np.asarray(f_left, dtype=np.float32))
-                            exp_fR_meas_values.append(np.asarray(f_right, dtype=np.float32))
+                            if step_fL_meas is not None and step_fR_meas is not None:
+                                exp_fL_meas_values.append(np.asarray(step_fL_meas, dtype=np.float32))
+                                exp_fR_meas_values.append(np.asarray(step_fR_meas, dtype=np.float32))
                         except Exception:
                             # If force obs is missing, skip silently (do not break main loop).
                             pass
 
-                        # debug_mode=4: 在线更新 Hybrid 力–位混合可视化
-                        if force_viz is not None and args.debug_mode == 4:
-                            try:
-                                force_viz.update(debug)
-                            except Exception:
-                                # 可视化失败不应中断主流程
-                                pass
+                    # debug_mode=4: 在线更新 Hybrid 力–位混合可视化
+                    if force_viz is not None and args.debug_mode == 4:
+                        try:
+                            force_viz.update(debug)
+                        except Exception:
+                            # 可视化失败不应中断主流程
+                            pass
 
                     total_steps_taken += 1
 
+                    if args.step_trace_path is not None:
+                        exp_step_trace_rows.append(
+                            {
+                                "schema_version": 1,
+                                "task_suite": args.task_suite,
+                                "task_id": int(args.task_id),
+                                "experiment_index": int(exp_idx),
+                                "hdf5_episode_index": dataset_episode_index,
+                                "env_step_index": int(total_steps_taken - 1),
+                                "inference_chunk_index": int(action_idx),
+                                "action_in_chunk_index": int(i),
+                                "fL_pred_local": step_fL_pred,
+                                "fR_pred_local": step_fR_pred,
+                                "fL_meas_local": step_fL_meas,
+                                "fR_meas_local": step_fR_meas,
+                                "squeeze_pred": step_squeeze_pred,
+                                "squeeze_meas": step_squeeze_meas,
+                                "ap_pred": step_ap_pred,
+                                "ap_meas": step_ap_meas,
+                                "predicted_contact": _contact_or_none(step_fL_pred, step_fR_pred),
+                                "measured_contact": _contact_or_none(step_fL_meas, step_fR_meas),
+                            }
+                        )
+
                     if terminated[0] or truncated[0]:
                         experiment_success = False
+                        end_reason = "terminated" if bool(terminated[0]) else "truncated"
                         break
 
                     if success_term is not None:
@@ -1060,6 +1151,7 @@ def run_closed_loop_policy(  # noqa: C901
                             success_step_count += 1
                             if success_step_count >= args.num_success_steps:
                                 experiment_success = True
+                                end_reason = "success"
                                 break
                         else:
                             success_step_count = 0
@@ -1207,100 +1299,84 @@ def run_closed_loop_policy(  # noqa: C901
                 if experiment_success:
                     successful_experiments += 1
                     current_sr = (successful_experiments / (exp_idx + 1)) * 100
-
-                    # 累加当前成功 experiment 的平均挤压力
-                    if exp_fsq_count > 0:
-                        avg_pred = exp_fsq_pred_sum / exp_fsq_count
-                        avg_meas = exp_fsq_meas_sum / exp_fsq_count
-                        succ_squeeze_pred_sum += avg_pred
-                        succ_squeeze_meas_sum += avg_meas
-                        succ_squeeze_count += 1
+                    if exp_fsq_pred_values and exp_fsq_meas_values:
+                        avg_pred = float(np.mean(exp_fsq_pred_values))
+                        avg_meas = float(np.mean(exp_fsq_meas_values))
                         print(
                             f"✓ Success | Current SR: {successful_experiments}/{exp_idx + 1} ({current_sr:.1f}%) "
                             f"| squeeze_pred={avg_pred:.4f}, squeeze_meas={avg_meas:.4f}"
                         )
                     else:
                         print(f"✓ Success | Current SR: {successful_experiments}/{exp_idx + 1} ({current_sr:.1f}%)")
-
-                    # Binary mode: record measured squeeze/apply metrics (no predicted forces).
-                    # We compute Top5% stats from per-step measured sequences to mirror hybrid reporting.
-                    if args.control_mode == "binary":
-                        # Strict: reuse metrics.py aggregation on the per-step LR force series.
-                        try:
-                            if exp_fL_meas_values and exp_fR_meas_values:
-                                fL = np.stack(exp_fL_meas_values, axis=0)  # (T,3)
-                                fR = np.stack(exp_fR_meas_values, axis=0)  # (T,3)
-                                meas_metrics = compute_contact_force_metrics_from_lr_forces(fL, fR)
-
-                                # Fill the "pred-style" metrics slots with measured metrics in binary mode
-                                # (there is no force prediction in this control mode).
-                                succ_metrics_count += 1
-                                succ_squeeze_max_sum += float(meas_metrics.squeeze_max)
-                                succ_app_max_sum += float(meas_metrics.external_norm_max)
-                                succ_app_mean_sum += float(meas_metrics.external_norm_mean)
-
-                                # Also populate measured aggregates (same definitions).
-                                succ_squeeze_max_meas_sum += float(meas_metrics.squeeze_max)
-                                succ_squeeze_max_meas_count += 1
-                                succ_ap_mean_meas_sum += float(meas_metrics.external_norm_mean)
-                                succ_ap_mean_meas_count += 1
-                                succ_ap_max_meas_sum += float(meas_metrics.external_norm_max)
-                                succ_ap_max_meas_count += 1
-                        except Exception:
-                            pass
-
-                    # 若为 Hybrid 控制模式且缓存到了 13D 动作，则为该成功 experiment 计算一次力学 metrics
-                    if args.control_mode in ("hybrid", "tactile") and exp_actions_13d:
-                        try:
-                            actions_13d = torch.stack(exp_actions_13d, dim=0).numpy()  # (T, 13)
-                            metrics = compute_contact_force_metrics_from_13d(actions_13d)
-                            succ_metrics_count += 1
-                            # squeeze_max / external_norm_max 已在 metrics.py 中按 Top5% 帧均值定义
-                            succ_squeeze_max_sum += metrics.squeeze_max
-                            succ_app_max_sum += metrics.external_norm_max
-                            succ_app_mean_sum += metrics.external_norm_mean
-
-                            # 统计当前成功 experiment 的「实测」挤压力 / 加持力指标
-                            # 1) 实测挤压力 Top5% 最大值（均值）
-                            sq_max_meas_top5 = compute_topk_mean(exp_fsq_meas_values, frac=0.05)
-                            if sq_max_meas_top5 is not None:
-                                succ_squeeze_max_meas_sum += sq_max_meas_top5
-                                succ_squeeze_max_meas_count += 1
-
-                            # 2) 实测加持力平均值（直接在该 demo 内求均值）
-                            if exp_ap_meas_values:
-                                ap_mean_meas = float(np.mean(exp_ap_meas_values))
-                                succ_ap_mean_meas_sum += ap_mean_meas
-                                succ_ap_mean_meas_count += 1
-
-                            # 3) 实测加持力 Top5% 最大值（均值）
-                            ap_max_meas_top5 = compute_topk_mean(exp_ap_meas_values, frac=0.05)
-                            if ap_max_meas_top5 is not None:
-                                succ_ap_max_meas_sum += ap_max_meas_top5
-                                succ_ap_max_meas_count += 1
-
-                            print(
-                                "    [Hybrid-Metrics] "
-                                f"squeeze_max={metrics.squeeze_max:.4f}, "
-                                f"squeeze_mean={metrics.squeeze_mean:.4f}, "
-                                f"app_max={metrics.external_norm_max:.4f}, "
-                                f"app_mean={metrics.external_norm_mean:.4f}"
-                            )
-                        except Exception:
-                            # metrics 计算失败不影响主流程
-                            pass
-
                     break
 
                 # Check if we broke out of inner loop due to unexpected termination
-                if i < args.replan_steps - 1 and (terminated[0] or truncated[0]):
+                if terminated[0] or truncated[0]:
                     current_sr = (successful_experiments / (exp_idx + 1)) * 100
-                    print(f"✗ Failed (terminated) | Current SR: {successful_experiments}/{exp_idx + 1} ({current_sr:.1f}%)")
+                    print(
+                        f"✗ Failed ({end_reason}) | Current SR: "
+                        f"{successful_experiments}/{exp_idx + 1} ({current_sr:.1f}%)"
+                    )
                     break
 
                 if action_idx >= args.max_inference_steps - 1:
                     current_sr = (successful_experiments / (exp_idx + 1)) * 100
                     print(f"✗ Failed (max steps) | Current SR: {successful_experiments}/{exp_idx + 1} ({current_sr:.1f}%)")
+
+            if args.control_mode in ("hybrid", "tactile"):
+                force_mode = "full"
+            elif args.control_mode == "binary":
+                force_mode = "measured_only"
+            else:
+                force_mode = "not_applicable"
+
+            force_summary = summarize_episode_force_metrics(
+                force_mode=force_mode,
+                env_steps=total_steps_taken,
+                actions_13d=exp_actions_13d,
+                squeeze_pred_values=exp_fsq_pred_values,
+                squeeze_meas_values=exp_fsq_meas_values,
+                ap_pred_values=exp_ap_pred_values,
+                ap_meas_values=exp_ap_meas_values,
+                fL_meas_values=exp_fL_meas_values,
+                fR_meas_values=exp_fR_meas_values,
+            )
+
+            trace_status = "disabled"
+            trace_rows_written = 0
+            trace_error = step_trace_open_error
+            if args.step_trace_path is not None:
+                trace_status = "partial"
+                if step_trace_fh is not None:
+                    try:
+                        for trace_row in exp_step_trace_rows:
+                            step_trace_fh.write(json.dumps(trace_row, ensure_ascii=False, separators=(",", ":")) + "\n")
+                            trace_rows_written += 1
+                        step_trace_fh.flush()
+                        if trace_rows_written == total_steps_taken:
+                            trace_status = "complete"
+                        else:
+                            trace_error = (
+                                f"trace rows {trace_rows_written} do not match env_steps {total_steps_taken}"
+                            )
+                    except Exception as exc:
+                        trace_error = str(exc)
+                        print(f"[Step-Trace] Failed while writing experiment {exp_idx}: {exc}")
+
+            episode_record = {
+                "experiment_index": int(exp_idx),
+                "hdf5_episode_index": dataset_episode_index,
+                "success": bool(experiment_success),
+                "end_reason": end_reason,
+                "env_steps": int(total_steps_taken),
+                "inference_chunks": int(inference_chunks_taken),
+                **force_summary,
+                "trace_status": trace_status,
+                "trace_rows": int(trace_rows_written),
+                "trace_error": trace_error,
+            }
+            episode_metrics_records.append(episode_record)
+            print("[Episode-Metrics] " + json.dumps(episode_record, ensure_ascii=False, separators=(",", ":")))
 
             # debug_mode=5: 每个 experiment 结束后落盘一份逐帧挤压力序列
             if force_dump_dir is not None:
@@ -1339,69 +1415,59 @@ def run_closed_loop_policy(  # noqa: C901
             except Exception:
                 pass
 
+    if step_trace_fh is not None:
+        try:
+            step_trace_fh.close()
+        except Exception:
+            pass
+
     success_rate = (successful_experiments / args.num_total_experiments) * 100
     print("\nEvaluation Results:")
     print(f"Total experiments: {args.num_total_experiments}")
     print(f"Successful experiments: {successful_experiments}")
     print(f"Success rate: {success_rate:.2f}%")
 
-    # 1) 挤压力平均值（预测 / 实测）——仅用于后续 metrics 行中输出
-    task_avg_pred = None
-    task_avg_meas = None
-    if succ_squeeze_count > 0:
-        task_avg_pred = succ_squeeze_pred_sum / succ_squeeze_count
-        task_avg_meas = succ_squeeze_meas_sum / succ_squeeze_count
-
-        # Keep backward-compatible line for scripts/tools/run_task_evaluations.py parser.
-        if args.control_mode in ("hybrid", "tactile", "binary"):
-            print(
-                f"[Hybrid] Task avg squeeze_pred={task_avg_pred:.4f}, squeeze_meas={task_avg_meas:.4f} "
-                f"over {succ_squeeze_count} successes"
-            )
-
-    # 2) Top5% 最大挤压力 / 最大加持力 + 平均加持力（预测 / 实测）——统一在 Hybrid-Metrics 一行输出
-    if succ_metrics_count > 0:
-        task_squeeze_max_mean = succ_squeeze_max_sum / succ_metrics_count
-        task_app_max_mean = succ_app_max_sum / succ_metrics_count
-        task_app_mean_mean = succ_app_mean_sum / succ_metrics_count
-
-        # 实测挤压力 / 加持力（若有）
-        task_squeeze_max_meas_mean = (
-            succ_squeeze_max_meas_sum / succ_squeeze_max_meas_count
-            if succ_squeeze_max_meas_count > 0
-            else None
-        )
-        task_ap_mean_meas_mean = (
-            succ_ap_mean_meas_sum / succ_ap_mean_meas_count if succ_ap_mean_meas_count > 0 else None
-        )
-        task_ap_max_meas_mean = (
-            succ_ap_max_meas_sum / succ_ap_max_meas_count if succ_ap_max_meas_count > 0 else None
+    force_aggregates, force_metric_counts = aggregate_success_force_metrics(episode_metrics_records)
+    task_avg_pred = force_aggregates["squeeze_avg_pred"]
+    task_avg_meas = force_aggregates["squeeze_avg_meas"]
+    if task_avg_pred is not None and task_avg_meas is not None:
+        print(
+            f"[Hybrid] Task avg squeeze_pred={task_avg_pred:.4f}, squeeze_meas={task_avg_meas:.4f} "
+            f"over {force_metric_counts['squeeze_avg_pred']} successes"
         )
 
+    contact_metric_count = max(
+        force_metric_counts["squeeze_max_pred"],
+        force_metric_counts["squeeze_max_meas"],
+        force_metric_counts["ap_avg_pred"],
+        force_metric_counts["ap_avg_meas"],
+        force_metric_counts["ap_max_pred"],
+        force_metric_counts["ap_max_meas"],
+    )
+    if contact_metric_count > 0:
         fragments: list[str] = []
         if task_avg_pred is not None:
             fragments.append(f"squeeze_avg_pred={task_avg_pred:.4f}")
         if task_avg_meas is not None:
             fragments.append(f"squeeze_avg_meas={task_avg_meas:.4f}")
 
-        fragments.extend(
-            [
-                f"squeeze_max_mean={task_squeeze_max_mean:.4f}",
-                f"app_max_mean={task_app_max_mean:.4f}",
-                f"app_mean_mean={task_app_mean_mean:.4f}",
-            ]
-        )
-        if task_squeeze_max_meas_mean is not None:
-            fragments.append(f"squeeze_max_meas_mean={task_squeeze_max_meas_mean:.4f}")
-        if task_ap_max_meas_mean is not None:
-            fragments.append(f"ap_max_meas_mean={task_ap_max_meas_mean:.4f}")
-        if task_ap_mean_meas_mean is not None:
-            fragments.append(f"ap_mean_meas_mean={task_ap_mean_meas_mean:.4f}")
+        output_key_map = {
+            "squeeze_max_pred": "squeeze_max_mean",
+            "ap_max_pred": "app_max_mean",
+            "ap_avg_pred": "app_mean_mean",
+            "squeeze_max_meas": "squeeze_max_meas_mean",
+            "ap_max_meas": "ap_max_meas_mean",
+            "ap_avg_meas": "ap_mean_meas_mean",
+        }
+        for metric_key, output_key in output_key_map.items():
+            value = force_aggregates[metric_key]
+            if value is not None:
+                fragments.append(f"{output_key}={value:.4f}")
 
         print(
             "[Hybrid-Metrics] Task contact_metrics "
             + ", ".join(fragments)
-            + f" over {succ_metrics_count} successes"
+            + f" over {contact_metric_count} successes"
         )
     # 关闭 Hybrid 力–位可视化窗口
     if force_viz is not None:
