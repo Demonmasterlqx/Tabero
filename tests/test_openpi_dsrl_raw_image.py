@@ -39,7 +39,7 @@ def _base_payload():
     }
 
 
-def test_production_step_sends_224_images_and_opt_in_raw_agentview_to_same_infer_payload():
+def test_production_step_sends_224_images_and_two_raw_views_to_same_infer_payload():
     infer_openpi_step = _infer_openpi_step()
     events = []
     client = FakeClient(events)
@@ -67,7 +67,14 @@ def test_production_step_sends_224_images_and_opt_in_raw_agentview_to_same_infer
     assert client.payload["dsrl_raw_image"].shape == (256, 256, 3)
     assert client.payload["dsrl_raw_image"].dtype == np.uint8
     assert np.all(client.payload["dsrl_raw_image"] == 13)
+    assert client.payload["dsrl_raw_wrist_image"].shape == (256, 256, 3)
+    assert client.payload["dsrl_raw_wrist_image"].dtype == np.uint8
+    assert np.all(client.payload["dsrl_raw_wrist_image"] == 7)
     assert client.payload[b"dsrl_raw_image"] is client.payload["dsrl_raw_image"]
+    assert (
+        client.payload[b"dsrl_raw_wrist_image"]
+        is client.payload["dsrl_raw_wrist_image"]
+    )
     assert client.payload[b"image"] is client.payload["image"]
     assert [frame.shape for frame in resized_frames] == [(1, 224, 224, 3), (1, 224, 224, 3)]
 
@@ -107,6 +114,8 @@ def test_production_step_default_payload_has_no_dsrl_raw_image():
     assert client.payload[b"observation/wrist_image"] is client.payload["wrist_image"]
     assert "dsrl_raw_image" not in client.payload
     assert b"dsrl_raw_image" not in client.payload
+    assert "dsrl_raw_wrist_image" not in client.payload
+    assert b"dsrl_raw_wrist_image" not in client.payload
 
 
 @pytest.mark.parametrize(
@@ -127,6 +136,80 @@ def test_production_step_opt_in_strictly_validates_raw_agentview(agentview, mess
         infer_openpi_step(
             client,
             camera_frames=camera_frames,
+            target_image_size=(224, 224, 3),
+            base_payload=_base_payload(),
+            send_dsrl_raw_image=True,
+        )
+
+    assert client.payload is None
+
+
+@pytest.mark.parametrize(
+    ("wrist", "message"),
+    [
+        (None, "dsrl_raw_wrist_image.*numpy.ndarray"),
+        (
+            np.zeros((1, 256, 256, 3), dtype=np.float32),
+            "dsrl_raw_wrist_image.*dtype uint8",
+        ),
+        (
+            np.zeros((1, 224, 224, 3), dtype=np.uint8),
+            r"dsrl_raw_wrist_image.*shape \(256, 256, 3\)",
+        ),
+    ],
+)
+def test_production_step_opt_in_strictly_validates_raw_wrist(wrist, message):
+    infer_openpi_step = _infer_openpi_step()
+    client = FakeClient()
+    camera_frames = [
+        ("agentview_cam", np.zeros((1, 512, 512, 3), dtype=np.uint8))
+    ]
+    if wrist is not None:
+        camera_frames.append(("eye_in_hand_cam", wrist))
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        infer_openpi_step(
+            client,
+            camera_frames=camera_frames,
+            target_image_size=(224, 224, 3),
+            base_payload=_base_payload(),
+            send_dsrl_raw_image=True,
+        )
+
+    assert client.payload is None
+
+
+def test_production_step_raw_views_accept_native_256_without_resizing():
+    infer_openpi_step = _infer_openpi_step()
+    client = FakeClient()
+    main = np.full((1, 256, 256, 3), 19, dtype=np.uint8)
+    wrist = np.full((1, 256, 256, 3), 23, dtype=np.uint8)
+
+    infer_openpi_step(
+        client,
+        camera_frames=(("agentview_cam", main), ("eye_in_hand_cam", wrist)),
+        target_image_size=(224, 224, 3),
+        base_payload=_base_payload(),
+        send_dsrl_raw_image=True,
+    )
+
+    assert np.all(client.payload["dsrl_raw_image"] == 19)
+    assert np.all(client.payload["dsrl_raw_wrist_image"] == 23)
+
+
+@pytest.mark.parametrize("camera_name", ["agentview_cam", "eye_in_hand_cam"])
+def test_production_step_rejects_duplicate_dsrl_camera(camera_name):
+    infer_openpi_step = _infer_openpi_step()
+    client = FakeClient()
+    frame = np.zeros((1, 512, 512, 3), dtype=np.uint8)
+    other_name = (
+        "eye_in_hand_cam" if camera_name == "agentview_cam" else "agentview_cam"
+    )
+
+    with pytest.raises(ValueError, match=f"duplicate {camera_name}"):
+        infer_openpi_step(
+            client,
+            camera_frames=((camera_name, frame), (camera_name, frame), (other_name, frame)),
             target_image_size=(224, 224, 3),
             base_payload=_base_payload(),
             send_dsrl_raw_image=True,

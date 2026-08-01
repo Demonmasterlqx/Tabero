@@ -219,6 +219,7 @@ class OpenpiClientArguments(ClosedLoopArguments):
     server_host: str = "127.0.1.1"
     server_port: int = 8000
     target_image_size: tuple[int, int, int] = (224, 224, 3)
+    # Send both 256x256 DSRL raw views (agentview and eye-in-hand).
     send_dsrl_raw_image: bool = False
 
     # Simulator specific parameters

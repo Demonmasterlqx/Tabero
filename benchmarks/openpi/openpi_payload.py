@@ -13,6 +13,7 @@ _PAYLOAD_ALIAS_KEYS = (
     "tactile_gripper_force",
     "tactile_marker_motion",
     "dsrl_raw_image",
+    "dsrl_raw_wrist_image",
     "observation/image",
     "observation/wrist_image",
     "observation/state",
@@ -51,38 +52,49 @@ def _resize_frames_with_padding(frames, target_image_size: tuple[int, int, int])
     return frames
 
 
-def _capture_dsrl_raw_image(camera_frames):
-    raw_image = None
+_DSRL_RAW_CAMERAS = {
+    "agentview_cam": "dsrl_raw_image",
+    "eye_in_hand_cam": "dsrl_raw_wrist_image",
+}
+
+
+def _capture_dsrl_raw_images(camera_frames):
+    raw_images = {}
     for camera_name, frame in camera_frames:
-        if camera_name != "agentview_cam":
+        payload_key = _DSRL_RAW_CAMERAS.get(camera_name)
+        if payload_key is None:
             continue
+        if payload_key in raw_images:
+            raise ValueError(f"send_dsrl_raw_image received duplicate {camera_name} frames.")
         raw_batch = _to_numpy(frame)
         if isinstance(raw_batch, np.ndarray) and raw_batch.shape[:1] == (1,):
             raw_image = raw_batch[0]
         else:
             raw_image = raw_batch
-        break
+        # Official Libero cameras render at 512 square. Produce each DSRL-native
+        # 256 frame independently of the standard OpenPI 224 preprocessing.
+        if isinstance(raw_image, np.ndarray) and raw_image.shape == (512, 512, 3):
+            raw_image = cv2.resize(
+                raw_image, (256, 256), interpolation=cv2.INTER_AREA
+            )
+        raw_images[payload_key] = raw_image
+    return raw_images
 
-    # Tabero's official Libero cameras render at 512 square. Produce the DSRL-native
-    # 256 frame independently of the standard OpenPI 224 preprocessing.
-    if isinstance(raw_image, np.ndarray) and raw_image.shape == (512, 512, 3):
-        raw_image = cv2.resize(raw_image, (256, 256), interpolation=cv2.INTER_AREA)
-    return raw_image
 
-
-def _validate_dsrl_raw_image(raw_image) -> None:
+def _validate_dsrl_raw_image(raw_image, *, payload_key: str) -> None:
     if not isinstance(raw_image, np.ndarray):
         raise TypeError(
-            "send_dsrl_raw_image requires the raw agentview image to be a numpy.ndarray, "
+            f"send_dsrl_raw_image requires {payload_key} to be a numpy.ndarray, "
             f"but got {type(raw_image).__name__}."
         )
     if raw_image.dtype != np.uint8:
         raise TypeError(
-            f"send_dsrl_raw_image requires the raw agentview image to have dtype uint8, but got {raw_image.dtype}."
+            f"send_dsrl_raw_image requires {payload_key} to have dtype uint8, "
+            f"but got {raw_image.dtype}."
         )
     if raw_image.shape != (256, 256, 3):
         raise ValueError(
-            "send_dsrl_raw_image requires the raw agentview image to have shape (256, 256, 3), "
+            f"send_dsrl_raw_image requires {payload_key} to have shape (256, 256, 3), "
             f"but got {raw_image.shape}."
         )
 
@@ -98,9 +110,14 @@ def infer_openpi_step(
 ):
     """Build one production payload and pass that exact object to ``client.infer``."""
     camera_frames = tuple(camera_frames)
-    raw_image = _capture_dsrl_raw_image(camera_frames) if send_dsrl_raw_image else None
+    raw_images = (
+        _capture_dsrl_raw_images(camera_frames) if send_dsrl_raw_image else {}
+    )
     if send_dsrl_raw_image:
-        _validate_dsrl_raw_image(raw_image)
+        for payload_key in _DSRL_RAW_CAMERAS.values():
+            _validate_dsrl_raw_image(
+                raw_images.get(payload_key), payload_key=payload_key
+            )
 
     resized_frames = tuple(_resize_frames_with_padding(frame, target_image_size) for _, frame in camera_frames)
     if len(resized_frames) < 2:
@@ -121,7 +138,7 @@ def infer_openpi_step(
         if key in original_payload:
             element[key] = original_payload[key]
     if send_dsrl_raw_image:
-        element["dsrl_raw_image"] = raw_image
+        element.update(raw_images)
     reserved_keys = {
         "image",
         "wrist_image",
@@ -131,6 +148,7 @@ def infer_openpi_step(
         "observation/state",
         "prompt",
         "dsrl_raw_image",
+        "dsrl_raw_wrist_image",
     }
     for key, value in original_payload.items():
         if key not in reserved_keys:
