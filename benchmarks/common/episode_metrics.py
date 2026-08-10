@@ -27,6 +27,174 @@ FORCE_METRIC_KEYS = (
 )
 
 
+def resolve_episode_termination(
+    *,
+    info: Any,
+    terminated: bool,
+    truncated: bool,
+) -> tuple[str, str | None]:
+    """Resolve a stable evaluator end reason from IsaacLab termination logs.
+
+    IsaacLab auto-resets a terminated environment before ``env.step`` returns,
+    but it preserves the triggering manager term under
+    ``info['log']['Episode_Termination/<term>']``.  Damage terms take precedence
+    over generic termination labels so a broken object cannot be reported as an
+    unexplained failure.
+    """
+
+    if truncated:
+        return "truncated", None
+    if not terminated:
+        return "running", None
+
+    log = info.get("log", {}) if isinstance(info, dict) else {}
+    if not isinstance(log, dict):
+        return "terminated", None
+
+    active_terms: list[str] = []
+    prefix = "Episode_Termination/"
+    for key, value in log.items():
+        if not isinstance(key, str) or not key.startswith(prefix):
+            continue
+        try:
+            if hasattr(value, "item"):
+                value = value.item()
+            active = float(value) > 0.0
+        except (TypeError, ValueError):
+            active = bool(value)
+        if active:
+            active_terms.append(key[len(prefix) :])
+
+    damage_terms = sorted(term for term in active_terms if term.startswith("object_damage_"))
+    if damage_terms:
+        return "object_damage", damage_terms[0]
+    if active_terms:
+        return "terminated", sorted(active_terms)[0]
+    return "terminated", None
+
+
+def extract_object_damage_details(
+    *, info: Any, terminal_term: str | None, env_index: int = 0
+) -> dict[str, Any] | None:
+    """Extract a JSON-safe damage trigger snapshot from IsaacLab extras."""
+
+    prefix = "object_damage_"
+    if not terminal_term or not terminal_term.startswith(prefix):
+        return None
+    object_name = terminal_term[len(prefix) :]
+    damage_root = info.get("object_damage", {}) if isinstance(info, dict) else {}
+    if not isinstance(damage_root, dict):
+        return None
+    raw = damage_root.get(object_name)
+    if not isinstance(raw, dict):
+        return None
+
+    def scalar(value: Any) -> Any:
+        try:
+            if hasattr(value, "detach"):
+                value = value.detach()
+            if hasattr(value, "reshape"):
+                value = value.reshape(-1)[env_index]
+            if hasattr(value, "item"):
+                value = value.item()
+        except (IndexError, TypeError, ValueError):
+            return None
+        return value
+
+    return {
+        "object_name": object_name,
+        "max_squeeze_force": float(raw["max_squeeze_force"]),
+        "consecutive_frames": int(raw["consecutive_frames"]),
+        "consecutive_count": int(scalar(raw.get("consecutive_count"))),
+        "measured_squeeze_force": float(scalar(raw.get("measured_squeeze_force"))),
+    }
+
+
+def extract_friction_snapshot(*, info: Any, env_index: int = 0) -> dict[str, Any] | None:
+    """Extract the currently active gripper/object friction pair from reset extras."""
+
+    root = info.get("physics_friction", {}) if isinstance(info, dict) else {}
+    if not isinstance(root, dict) or not root:
+        return None
+
+    def scalar(value: Any) -> float | None:
+        try:
+            if hasattr(value, "detach"):
+                value = value.detach()
+            if hasattr(value, "reshape"):
+                value = value.reshape(-1)[env_index]
+            if hasattr(value, "item"):
+                value = value.item()
+            result = float(value)
+        except (IndexError, TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) else None
+
+    def pair(value: Any) -> dict[str, float] | None:
+        if not isinstance(value, dict):
+            return None
+        static_friction = scalar(value.get("static_friction"))
+        dynamic_friction = scalar(value.get("dynamic_friction"))
+        if static_friction is None or dynamic_friction is None:
+            return None
+        return {
+            "static_friction": static_friction,
+            "dynamic_friction": dynamic_friction,
+        }
+
+    gripper = pair(root.get("gripper"))
+    objects = {
+        name: parsed
+        for name, raw in sorted(root.items())
+        if name != "gripper" and (parsed := pair(raw)) is not None
+    }
+    if gripper is None and not objects:
+        return None
+    return {"gripper": gripper, "objects": objects}
+
+
+def summarize_friction_statistics(episodes: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize configured friction samples over all recorded episodes."""
+
+    scopes: dict[str, dict[str, list[float]]] = {}
+    for episode in episodes:
+        friction = episode.get("friction")
+        if not isinstance(friction, dict):
+            continue
+        gripper = friction.get("gripper")
+        if isinstance(gripper, dict):
+            scopes.setdefault("gripper", {"static_friction": [], "dynamic_friction": []})
+            for key in ("static_friction", "dynamic_friction"):
+                value = gripper.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+                    scopes["gripper"][key].append(float(value))
+        objects = friction.get("objects", {})
+        if not isinstance(objects, dict):
+            continue
+        for object_name, pair in objects.items():
+            if not isinstance(object_name, str) or not isinstance(pair, dict):
+                continue
+            scope_name = f"object:{object_name}"
+            scopes.setdefault(scope_name, {"static_friction": [], "dynamic_friction": []})
+            for key in ("static_friction", "dynamic_friction"):
+                value = pair.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+                    scopes[scope_name][key].append(float(value))
+
+    result: dict[str, Any] = {}
+    for scope_name, fields in sorted(scopes.items()):
+        scope_summary: dict[str, Any] = {}
+        for field_name, values in fields.items():
+            scope_summary[field_name] = {
+                "count": len(values),
+                "mean": _mean_or_none(values),
+                "min": min(values) if values else None,
+                "max": max(values) if values else None,
+            }
+        result[scope_name] = scope_summary
+    return result
+
+
 def _float_values(values: Iterable[float]) -> list[float]:
     finite_values: list[float] = []
     for value in values:

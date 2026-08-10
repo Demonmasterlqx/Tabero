@@ -37,6 +37,9 @@ from benchmarks.common.closedloop_policy_inference import (
 )
 from benchmarks.common.episode_metrics import (
     aggregate_success_force_metrics,
+    extract_friction_snapshot,
+    extract_object_damage_details,
+    resolve_episode_termination,
     summarize_episode_force_metrics,
 )
 from benchmarks.common.metrics import (
@@ -681,6 +684,9 @@ def run_closed_loop_policy(  # noqa: C901
             total_steps_taken = 0
             inference_chunks_taken = 0
             end_reason = "max_inference_steps"
+            terminal_term: str | None = None
+            damage_details: dict | None = None
+            friction_snapshot: dict | None = None
             dataset_episode_index: int | None = None
 
             # 当前 experiment 的逐帧挤压力 / 加持力记录（用于 Top5% 统计）
@@ -744,6 +750,8 @@ def run_closed_loop_policy(  # noqa: C901
             else:
                 # Fallback to default reset if no dataset file specified or doesn't exist
                 obs, info = env.reset()
+
+            friction_snapshot = extract_friction_snapshot(info=info, env_index=0)
 
             # Reset online histories per experiment to match dataset windowing.
             tactile_buf.reset()
@@ -1143,7 +1151,15 @@ def run_closed_loop_policy(  # noqa: C901
 
                     if terminated[0] or truncated[0]:
                         experiment_success = False
-                        end_reason = "terminated" if bool(terminated[0]) else "truncated"
+                        end_reason, terminal_term = resolve_episode_termination(
+                            info=info,
+                            terminated=bool(terminated[0]),
+                            truncated=bool(truncated[0]),
+                        )
+                        damage_details = extract_object_damage_details(
+                            info=info,
+                            terminal_term=terminal_term,
+                        )
                         break
 
                     if success_term is not None:
@@ -1368,6 +1384,9 @@ def run_closed_loop_policy(  # noqa: C901
                 "hdf5_episode_index": dataset_episode_index,
                 "success": bool(experiment_success),
                 "end_reason": end_reason,
+                "terminal_term": terminal_term,
+                "object_damage": damage_details,
+                "friction": friction_snapshot,
                 "env_steps": int(total_steps_taken),
                 "inference_chunks": int(inference_chunks_taken),
                 **force_summary,

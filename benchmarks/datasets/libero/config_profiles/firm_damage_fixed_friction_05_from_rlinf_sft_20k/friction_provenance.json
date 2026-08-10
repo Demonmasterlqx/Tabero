@@ -1,0 +1,23 @@
+{
+  "profile": "firm_damage_fixed_friction_05_from_rlinf_sft_20k",
+  "purpose": "Explicitly exercise Tabero gripper/object friction configuration during the formal Firm evaluation without changing the previous default coefficient.",
+  "task_ids": [0, 1, 2, 3, 5, 6, 7, 8, 9],
+  "gripper": {
+    "static_friction": 0.5,
+    "dynamic_friction": 0.5,
+    "scope": ["panda_leftfinger", "panda_rightfinger"]
+  },
+  "objects": {
+    "scope": "each task obj_of_interest",
+    "static_friction": 0.5,
+    "dynamic_friction": 0.5
+  },
+  "apply_on": "startup",
+  "task_4": "unchanged and excluded from the Firm evaluation subset",
+  "notes": [
+    "The values match the previous IsaacLab default rigid-body material coefficient.",
+    "Uniform friction randomization is validated separately with a runtime smoke profile.",
+    "Task 5 retains reset-time mass randomization in [0.08, 0.12] kg.",
+    "Damage thresholds and consecutive_frames=4 are inherited unchanged from firm_damage_from_rlinf_sft_20k."
+  ]
+}

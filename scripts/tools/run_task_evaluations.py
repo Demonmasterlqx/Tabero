@@ -27,6 +27,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from benchmarks.common.episode_metrics import (
     FORCE_METRIC_KEYS,
     aggregate_success_force_metrics,
+    summarize_friction_statistics,
     summarize_step_statistics,
     validate_episode_records,
 )
@@ -219,6 +220,8 @@ def build_command(
             cmd.append("--send-dsrl-raw-image")
         if config.task:
             cmd.extend(["--task", config.task])
+        if config.config_path:
+            cmd.extend(["--task_config_path", str(config.config_path)])
         # Optional prompt rewrite knobs
         # Always pass prompt_seed explicitly (including 0) so prompt behavior is stable and traceable.
         cmd.extend(["--prompt_seed", str(config.prompt_seed)])
@@ -535,6 +538,7 @@ def collect_episode_metric_artifacts(
         "metrics_warnings": metrics_warnings,
         "step_statistics": summarize_step_statistics(episodes),
         "force_metric_episode_counts": force_metric_episode_counts,
+        "friction_statistics": summarize_friction_statistics(episodes),
         "episodes": episodes,
         "step_trace": step_trace,
     }
@@ -577,6 +581,8 @@ def run_single_evaluation(
     
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    if config.config_path:
+        env["LIBERO_CONFIG_DIR"] = str(config.config_path.resolve())
     if "USE_RELATIVE_MODE" not in env:
         env["USE_RELATIVE_MODE"] = "False"
 
@@ -871,6 +877,7 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "force_metric_episode_counts": result.get(
                 "force_metric_episode_counts", {key: 0 for key in FORCE_METRIC_KEYS}
             ),
+            "friction_statistics": result.get("friction_statistics", {}),
             "episodes": result.get("episodes", []),
             "step_trace": result.get(
                 "step_trace", {"enabled": False, "path": None, "rows": 0, "status": "disabled"}
@@ -941,10 +948,40 @@ def _write_episode_metrics_txt(output, result: dict) -> None:
         f"status={trace.get('status', 'partial')}\n"
     )
 
+    friction_statistics = result.get("friction_statistics", {})
+    output.write("    Friction statistics:\n")
+    if not friction_statistics:
+        output.write("      N/A\n")
+    else:
+        output.write(
+            "      scope | static_count | static_mean | static_min | static_max | "
+            "dynamic_count | dynamic_mean | dynamic_min | dynamic_max\n"
+        )
+        for scope_name, scope in sorted(friction_statistics.items()):
+            static = scope.get("static_friction", {})
+            dynamic = scope.get("dynamic_friction", {})
+            output.write(
+                "      "
+                + " | ".join(
+                    [
+                        str(scope_name),
+                        _txt_value(static.get("count")),
+                        _txt_value(static.get("mean")),
+                        _txt_value(static.get("min")),
+                        _txt_value(static.get("max")),
+                        _txt_value(dynamic.get("count")),
+                        _txt_value(dynamic.get("mean")),
+                        _txt_value(dynamic.get("min")),
+                        _txt_value(dynamic.get("max")),
+                    ]
+                )
+                + "\n"
+            )
+
     episodes = result.get("episodes", [])
     output.write("    Per-experiment step and force coverage:\n")
     output.write(
-        "      exp | hdf5_episode | success | end_reason | env_steps | chunks | force_status | "
+        "      exp | hdf5_episode | success | end_reason | terminal_term | env_steps | chunks | force_status | "
         "pred_samples | meas_samples | pred_contact | meas_contact | coverage\n"
     )
     if not episodes:
@@ -967,6 +1004,7 @@ def _write_episode_metrics_txt(output, result: dict) -> None:
                     _txt_value(episode.get("hdf5_episode_index")),
                     _txt_value(episode.get("success")),
                     _txt_value(episode.get("end_reason")),
+                    _txt_value(episode.get("terminal_term")),
                     _txt_value(episode.get("env_steps")),
                     _txt_value(episode.get("inference_chunks")),
                     _txt_value(episode.get("force_status")),
@@ -975,6 +1013,37 @@ def _write_episode_metrics_txt(output, result: dict) -> None:
                     pred_contact,
                     meas_contact,
                     _txt_value(samples.get("coverage_ratio"), precision=3),
+                ]
+            )
+            + "\n"
+        )
+
+    output.write("    Per-experiment friction:\n")
+    output.write(
+        "      exp | gripper_static | gripper_dynamic | object_name | object_static | object_dynamic\n"
+    )
+    if not episodes:
+        output.write("      N/A\n")
+    for episode in episodes:
+        friction = episode.get("friction") or {}
+        gripper = friction.get("gripper") or {}
+        objects = friction.get("objects") or {}
+        if objects:
+            object_name = sorted(objects)[0]
+            object_pair = objects[object_name]
+        else:
+            object_name = None
+            object_pair = {}
+        output.write(
+            "      "
+            + " | ".join(
+                [
+                    _txt_value(episode.get("experiment_index")),
+                    _txt_value(gripper.get("static_friction")),
+                    _txt_value(gripper.get("dynamic_friction")),
+                    _txt_value(object_name),
+                    _txt_value(object_pair.get("static_friction")),
+                    _txt_value(object_pair.get("dynamic_friction")),
                 ]
             )
             + "\n"

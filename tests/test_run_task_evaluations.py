@@ -116,6 +116,55 @@ def test_openpi_sim_launcher_args_are_passed_to_client_command():
     assert "--sim_kit_args=--/renderer/activeGpu=8" in cmd
 
 
+def test_config_path_is_passed_to_openpi_client_and_isaac_environment(monkeypatch, tmp_path):
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    (profile_dir / "libero_object.json").write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": 0,
+                        "task_name": "task",
+                        "language_instruction": "instruction",
+                    }
+                ]
+            }
+        )
+    )
+    config = rte.EvaluationConfig(
+        policy_model="openpi",
+        config_path=profile_dir,
+        num_total_experiments=1,
+    )
+
+    command = rte.build_command(config, "libero_object", 0)
+    assert command[command.index("--task_config_path") + 1] == str(profile_dir)
+
+    captured = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = io.StringIO(
+                "Total experiments: 1\n"
+                "Successful experiments: 0\n"
+                "Success rate: 0.00%\n"
+            )
+
+        def wait(self, timeout):
+            assert timeout == 3600
+
+    def fake_popen(*args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    monkeypatch.setattr(rte.subprocess, "Popen", fake_popen)
+    rte.run_single_evaluation(config, "libero_object", 0, ROOT)
+
+    assert captured["env"]["LIBERO_CONFIG_DIR"] == str(profile_dir.resolve())
+
+
 def test_dsrl_raw_image_flag_is_opt_in_for_openpi_client_command():
     default_cmd = rte.build_command(rte.EvaluationConfig(policy_model="openpi"), "libero_object", 0)
     enabled_cmd = rte.build_command(
@@ -394,6 +443,12 @@ def test_step_trace_dir_without_record_flag_is_rejected(tmp_path):
 def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
     episode = _episode_record(0, success=False, env_steps=10, chunks=1)
     episode["squeeze_avg_pred"] = None
+    episode["friction"] = {
+        "gripper": {"static_friction": 0.5, "dynamic_friction": 0.5},
+        "objects": {
+            "cream_cheese_1": {"static_friction": 0.5, "dynamic_friction": 0.5}
+        },
+    }
     config = rte.EvaluationConfig(num_total_experiments=1, replan_steps=10)
     result = {
         "task_suite": "libero_object",
@@ -410,6 +465,7 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
         "metrics_warnings": [],
         "step_statistics": rte.summarize_step_statistics([episode]),
         "force_metric_episode_counts": {key: 0 for key in rte.FORCE_METRIC_KEYS},
+        "friction_statistics": rte.summarize_friction_statistics([episode]),
         "episodes": [episode],
         "step_trace": {"enabled": False, "path": None, "rows": 0, "status": "disabled"},
     }
@@ -423,6 +479,11 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
     text = txt_path.read_text()
     assert task["metrics_status"] == "complete"
     assert task["episodes"][0]["env_steps"] == 10
+    assert task["episodes"][0]["friction"]["gripper"]["static_friction"] == 0.5
+    assert task["friction_statistics"]["gripper"]["dynamic_friction"]["mean"] == 0.5
     assert "Per-experiment step and force coverage:" in text
+    assert "Friction statistics:" in text
+    assert "Per-experiment friction:" in text
+    assert "cream_cheese_1 | 0.5000 | 0.5000" in text
     assert "Per-experiment force metrics:" in text
     assert "N/A" in text

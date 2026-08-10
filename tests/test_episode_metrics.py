@@ -12,10 +12,136 @@ if str(ROOT) not in sys.path:
 from benchmarks.common.episode_metrics import (
     FORCE_METRIC_KEYS,
     aggregate_success_force_metrics,
+    extract_friction_snapshot,
+    extract_object_damage_details,
+    resolve_episode_termination,
     summarize_episode_force_metrics,
+    summarize_friction_statistics,
     summarize_step_statistics,
     validate_episode_records,
 )
+
+
+def test_extract_friction_snapshot_is_json_safe():
+    snapshot = extract_friction_snapshot(
+        info={
+            "physics_friction": {
+                "gripper": {
+                    "static_friction": np.asarray([0.8]),
+                    "dynamic_friction": np.asarray([0.6]),
+                },
+                "tomato_sauce_1": {
+                    "static_friction": np.asarray([0.7]),
+                    "dynamic_friction": np.asarray([0.5]),
+                },
+            }
+        }
+    )
+
+    assert snapshot == {
+        "gripper": {"static_friction": 0.8, "dynamic_friction": 0.6},
+        "objects": {
+            "tomato_sauce_1": {
+                "static_friction": 0.7,
+                "dynamic_friction": 0.5,
+            }
+        },
+    }
+
+
+def test_summarize_friction_statistics_keeps_scope_counts():
+    episodes = [
+        {
+            "friction": {
+                "gripper": {"static_friction": 0.8, "dynamic_friction": 0.6},
+                "objects": {
+                    "tomato_sauce_1": {
+                        "static_friction": 0.5,
+                        "dynamic_friction": 0.4,
+                    }
+                },
+            }
+        },
+        {
+            "friction": {
+                "gripper": {"static_friction": 1.0, "dynamic_friction": 0.8},
+                "objects": {
+                    "tomato_sauce_1": {
+                        "static_friction": 0.7,
+                        "dynamic_friction": 0.6,
+                    }
+                },
+            }
+        },
+    ]
+
+    summary = summarize_friction_statistics(episodes)
+    assert summary["gripper"]["static_friction"] == {
+        "count": 2,
+        "mean": pytest.approx(0.9),
+        "min": 0.8,
+        "max": 1.0,
+    }
+    assert summary["object:tomato_sauce_1"]["dynamic_friction"] == {
+        "count": 2,
+        "mean": pytest.approx(0.5),
+        "min": 0.4,
+        "max": 0.6,
+    }
+
+
+def test_resolve_episode_termination_reports_object_damage_term():
+    reason, term = resolve_episode_termination(
+        info={
+            "log": {
+                "Episode_Termination/object_damage_tomato_sauce_1": 1.0,
+                "Episode_Termination/object_1_dropped": 0.0,
+            }
+        },
+        terminated=True,
+        truncated=False,
+    )
+
+    assert reason == "object_damage"
+    assert term == "object_damage_tomato_sauce_1"
+
+
+def test_resolve_episode_termination_preserves_non_damage_and_timeout_cases():
+    assert resolve_episode_termination(
+        info={"log": {"Episode_Termination/object_1_dropped": 1.0}},
+        terminated=True,
+        truncated=False,
+    ) == ("terminated", "object_1_dropped")
+    assert resolve_episode_termination(
+        info={}, terminated=False, truncated=True
+    ) == ("truncated", None)
+    assert resolve_episode_termination(
+        info={}, terminated=False, truncated=False
+    ) == ("running", None)
+
+
+def test_extract_object_damage_details_is_json_safe_and_keeps_default_count():
+    details = extract_object_damage_details(
+        info={
+            "object_damage": {
+                "tomato_sauce_1": {
+                    "max_squeeze_force": 1.0,
+                    "consecutive_frames": 4,
+                    "consecutive_count": np.asarray([4]),
+                    "measured_squeeze_force": np.asarray([12.5]),
+                }
+            }
+        },
+        terminal_term="object_damage_tomato_sauce_1",
+    )
+
+    assert details == {
+        "object_name": "tomato_sauce_1",
+        "max_squeeze_force": 1.0,
+        "consecutive_frames": 4,
+        "consecutive_count": 4,
+        "measured_squeeze_force": 12.5,
+    }
 
 
 def _force_sequences(num_steps: int = 20):

@@ -13,14 +13,132 @@ the termination introduced by the function.
 from __future__ import annotations
 
 import torch
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+import isaaclab.utils.math as math_utils
+from isaaclab.managers.manager_base import ManagerTermBase
 from tac_manip.utils.decorators import subtask_termination
 
 from isaaclab.assets import RigidObject
+from isaaclab.sensors import ContactSensor, FrameTransformer
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+def object_filtered_gripper_force_local(
+    env: "ManagerBasedRLEnv",
+    contact_sensor_name: str,
+    left_gripper_frame_name: str = "left_gripper_frame",
+    right_gripper_frame_name: str = "right_gripper_frame",
+) -> torch.Tensor:
+    """Return current left/right forces caused only by the configured object.
+
+    The object-specific ``contact_grasp_<object>`` sensor has a filter prim for
+    the target object.  ``force_matrix_w`` must be used here: ``net_forces_w``
+    also includes contacts against unrelated bodies such as the table or basket.
+
+    Returns:
+        Tensor with shape ``(num_envs, 2, 3)`` in the two finger-local frames.
+    """
+
+    sensor: ContactSensor = env.scene[contact_sensor_name]
+    force_matrix_w = sensor.data.force_matrix_w
+    if force_matrix_w is None:
+        raise RuntimeError(
+            f"Contact sensor {contact_sensor_name!r} has no force_matrix_w; "
+            "an object filter_prim_paths_expr is required."
+        )
+    if force_matrix_w.ndim != 4 or force_matrix_w.shape[1] != 2:
+        raise RuntimeError(
+            f"Contact sensor {contact_sensor_name!r} must provide (N,2,M,3) "
+            f"force_matrix_w, got {tuple(force_matrix_w.shape)}."
+        )
+
+    # Sum over filtered target prims. Shape: (N, 2 fingers, 3).
+    force_lr_w = force_matrix_w.sum(dim=2)
+    left_frame: FrameTransformer = env.scene[left_gripper_frame_name]
+    right_frame: FrameTransformer = env.scene[right_gripper_frame_name]
+    left_quat_inv = math_utils.quat_inv(left_frame.data.target_quat_w[:, 0, :])
+    right_quat_inv = math_utils.quat_inv(right_frame.data.target_quat_w[:, 0, :])
+    left_local = math_utils.quat_apply(left_quat_inv, force_lr_w[:, 0, :])
+    right_local = math_utils.quat_apply(right_quat_inv, force_lr_w[:, 1, :])
+    return torch.stack((left_local, right_local), dim=1)
+
+
+class object_damage_from_squeeze(ManagerTermBase):
+    """Terminate after object-specific squeeze exceeds its limit consecutively."""
+
+    def __init__(self, cfg, env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        self._consecutive_counts = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
+        self._latest_squeeze = torch.zeros(env.num_envs, device=env.device)
+
+    @property
+    def consecutive_counts(self) -> torch.Tensor:
+        """Current consecutive exceedance counts, exposed for runtime audits."""
+
+        return self._consecutive_counts
+
+    @property
+    def latest_squeeze(self) -> torch.Tensor:
+        """Latest measured object-specific squeeze, exposed for runtime audits."""
+
+        return self._latest_squeeze
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        self._consecutive_counts[env_ids] = 0
+        self._latest_squeeze[env_ids] = 0.0
+
+    def __call__(
+        self,
+        env: "ManagerBasedRLEnv",
+        object_name: str,
+        contact_sensor_name: str,
+        max_squeeze_force: float,
+        consecutive_frames: int = 4,
+        left_gripper_frame_name: str = "left_gripper_frame",
+        right_gripper_frame_name: str = "right_gripper_frame",
+    ) -> torch.Tensor:
+        force_lr_local = object_filtered_gripper_force_local(
+            env,
+            contact_sensor_name=contact_sensor_name,
+            left_gripper_frame_name=left_gripper_frame_name,
+            right_gripper_frame_name=right_gripper_frame_name,
+        )
+        abs_left_z = torch.abs(force_lr_local[:, 0, 2])
+        abs_right_z = torch.abs(force_lr_local[:, 1, 2])
+        self._latest_squeeze[:] = 2.0 * torch.minimum(abs_left_z, abs_right_z)
+
+        exceeded = self._latest_squeeze > float(max_squeeze_force)
+        self._consecutive_counts[:] = torch.where(
+            exceeded,
+            self._consecutive_counts + 1,
+            torch.zeros_like(self._consecutive_counts),
+        )
+        triggered = self._consecutive_counts >= int(consecutive_frames)
+
+        damage_extras = env.extras.setdefault("object_damage", {})
+        if not isinstance(damage_extras, dict):
+            damage_extras = {}
+            env.extras["object_damage"] = damage_extras
+        # Clear stale data from the preceding step/episode. If this term fires,
+        # write a snapshot before IsaacLab auto-resets the environment.
+        damage_extras.pop(object_name, None)
+        if torch.any(triggered):
+            damage_extras[object_name] = {
+                "max_squeeze_force": float(max_squeeze_force),
+                "consecutive_frames": int(consecutive_frames),
+                "consecutive_count": self._consecutive_counts.detach().clone(),
+                "measured_squeeze_force": self._latest_squeeze.detach().clone(),
+                "triggered": triggered.detach().clone(),
+            }
+        return triggered
 
 
 def _extract_single_joint_position(rigid_object: RigidObject, joint_pattern: str) -> torch.Tensor:
