@@ -37,6 +37,7 @@ from benchmarks.common.closedloop_policy_inference import (
 )
 from benchmarks.common.episode_metrics import (
     aggregate_success_force_metrics,
+    extract_damage_threshold_snapshot,
     extract_friction_snapshot,
     extract_object_damage_details,
     resolve_episode_termination,
@@ -686,6 +687,7 @@ def run_closed_loop_policy(  # noqa: C901
             end_reason = "max_inference_steps"
             terminal_term: str | None = None
             damage_details: dict | None = None
+            damage_threshold_snapshot: dict | None = None
             friction_snapshot: dict | None = None
             dataset_episode_index: int | None = None
 
@@ -752,6 +754,9 @@ def run_closed_loop_policy(  # noqa: C901
                 obs, info = env.reset()
 
             friction_snapshot = extract_friction_snapshot(info=info, env_index=0)
+            damage_threshold_snapshot = extract_damage_threshold_snapshot(
+                info=info, env_index=0
+            )
 
             # Reset online histories per experiment to match dataset windowing.
             tactile_buf.reset()
@@ -1386,6 +1391,7 @@ def run_closed_loop_policy(  # noqa: C901
                 "end_reason": end_reason,
                 "terminal_term": terminal_term,
                 "object_damage": damage_details,
+                "damage_threshold": damage_threshold_snapshot,
                 "friction": friction_snapshot,
                 "env_steps": int(total_steps_taken),
                 "inference_chunks": int(inference_chunks_taken),

@@ -12,10 +12,12 @@ if str(ROOT) not in sys.path:
 from benchmarks.common.episode_metrics import (
     FORCE_METRIC_KEYS,
     aggregate_success_force_metrics,
+    extract_damage_threshold_snapshot,
     extract_friction_snapshot,
     extract_object_damage_details,
     resolve_episode_termination,
     summarize_episode_force_metrics,
+    summarize_damage_threshold_statistics,
     summarize_friction_statistics,
     summarize_step_statistics,
     validate_episode_records,
@@ -137,11 +139,82 @@ def test_extract_object_damage_details_is_json_safe_and_keeps_default_count():
 
     assert details == {
         "object_name": "tomato_sauce_1",
+        "mode": "fixed",
+        "mass_kg": None,
+        "gravity_m_s2": None,
+        "gripper_static_friction": None,
+        "object_static_friction": None,
+        "effective_static_friction": None,
+        "tolerance_factor": None,
         "max_squeeze_force": 1.0,
         "consecutive_frames": 4,
         "consecutive_count": 4,
         "measured_squeeze_force": 12.5,
     }
+
+
+def test_extract_mass_friction_damage_threshold_snapshot_is_json_safe():
+    snapshot = extract_damage_threshold_snapshot(
+        info={
+            "object_damage_threshold": {
+                "tomato_sauce_1": {
+                    "mode": "mass_friction",
+                    "mass_kg": np.asarray([0.1]),
+                    "gravity_m_s2": np.asarray([9.81]),
+                    "gripper_static_friction": np.asarray([0.5]),
+                    "object_static_friction": np.asarray([0.7]),
+                    "effective_static_friction": np.asarray([0.6]),
+                    "tolerance_factor": 1.1,
+                    "max_squeeze_force": np.asarray([1.7985]),
+                    "consecutive_frames": 4,
+                }
+            }
+        }
+    )
+
+    assert snapshot == {
+        "object_name": "tomato_sauce_1",
+        "mode": "mass_friction",
+        "mass_kg": pytest.approx(0.1),
+        "gravity_m_s2": pytest.approx(9.81),
+        "gripper_static_friction": pytest.approx(0.5),
+        "object_static_friction": pytest.approx(0.7),
+        "effective_static_friction": pytest.approx(0.6),
+        "tolerance_factor": pytest.approx(1.1),
+        "max_squeeze_force": pytest.approx(1.7985),
+        "consecutive_frames": 4,
+    }
+
+
+def test_summarize_damage_threshold_statistics_tracks_reset_values():
+    episodes = [
+        {
+            "damage_threshold": {
+                "object_name": "tomato_sauce_1",
+                "mass_kg": 0.08,
+                "effective_static_friction": 0.5,
+                "max_squeeze_force": 1.72656,
+            }
+        },
+        {
+            "damage_threshold": {
+                "object_name": "tomato_sauce_1",
+                "mass_kg": 0.12,
+                "effective_static_friction": 0.6,
+                "max_squeeze_force": 2.1582,
+            }
+        },
+    ]
+
+    summary = summarize_damage_threshold_statistics(episodes)["tomato_sauce_1"]
+    assert summary["mass_kg"] == {
+        "count": 2,
+        "mean": pytest.approx(0.1),
+        "min": 0.08,
+        "max": 0.12,
+    }
+    assert summary["effective_static_friction"]["count"] == 2
+    assert summary["max_squeeze_force"]["mean"] == pytest.approx(1.94238)
 
 
 def _force_sequences(num_steps: int = 20):

@@ -348,12 +348,23 @@
         "objects": {
           "alphabet_soup_1": {
             "damage": {
-              "max_squeeze_force": 73.726,
+              "threshold": {
+                "mode": "mass_friction",
+                "tolerance_factor": 1.1
+              },
               "consecutive_frames": 4
             },
             "friction": {
-              "static": 0.5,
-              "dynamic": 0.5
+              "distribution": "uniform",
+              "static_range": [0.4, 0.8],
+              "dynamic_range": [0.3, 0.6],
+              "apply_on": "reset",
+              "num_buckets": 64
+            },
+            "mass_kg": {
+              "distribution": "uniform",
+              "range": [0.8, 1.2],
+              "apply_on": "reset"
             }
           }
         },
@@ -711,7 +722,10 @@
         "objects": {
           "cream_cheese_1": {
             "damage": {
-              "max_squeeze_force": 47.1633,
+              "threshold": {
+                "mode": "mass_friction",
+                "tolerance_factor": 1.1
+              },
               "consecutive_frames": 4
             },
             "friction": {
@@ -1074,7 +1088,10 @@
         "objects": {
           "salad_dressing_1": {
             "damage": {
-              "max_squeeze_force": 16.4627,
+              "threshold": {
+                "mode": "mass_friction",
+                "tolerance_factor": 1.1
+              },
               "consecutive_frames": 4
             },
             "friction": {
@@ -1437,7 +1454,10 @@
         "objects": {
           "bbq_sauce_1": {
             "damage": {
-              "max_squeeze_force": 13.8459,
+              "threshold": {
+                "mode": "mass_friction",
+                "tolerance_factor": 1.1
+              },
               "consecutive_frames": 4
             },
             "friction": {
@@ -2151,7 +2171,10 @@
               "apply_on": "reset"
             },
             "damage": {
-              "max_squeeze_force": 54.0869,
+              "threshold": {
+                "mode": "mass_friction",
+                "tolerance_factor": 1.1
+              },
               "consecutive_frames": 4
             },
             "friction": {
@@ -2514,7 +2537,10 @@
         "objects": {
           "butter_1": {
             "damage": {
-              "max_squeeze_force": 38.1775,
+              "threshold": {
+                "mode": "mass_friction",
+                "tolerance_factor": 1.1
+              },
               "consecutive_frames": 4
             },
             "friction": {
@@ -2877,7 +2903,10 @@
         "objects": {
           "milk_1": {
             "damage": {
-              "max_squeeze_force": 48.9534,
+              "threshold": {
+                "mode": "mass_friction",
+                "tolerance_factor": 1.1
+              },
               "consecutive_frames": 4
             },
             "friction": {
@@ -3240,7 +3269,10 @@
         "objects": {
           "chocolate_pudding_1": {
             "damage": {
-              "max_squeeze_force": 58.0237,
+              "threshold": {
+                "mode": "mass_friction",
+                "tolerance_factor": 1.1
+              },
               "consecutive_frames": 4
             },
             "friction": {
@@ -3603,7 +3635,10 @@
         "objects": {
           "orange_juice_1": {
             "damage": {
-              "max_squeeze_force": 35.3483,
+              "threshold": {
+                "mode": "mass_friction",
+                "tolerance_factor": 1.1
+              },
               "consecutive_frames": 4
             },
             "friction": {

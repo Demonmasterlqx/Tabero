@@ -449,6 +449,18 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
             "cream_cheese_1": {"static_friction": 0.5, "dynamic_friction": 0.5}
         },
     }
+    episode["damage_threshold"] = {
+        "object_name": "cream_cheese_1",
+        "mode": "mass_friction",
+        "mass_kg": 0.2,
+        "gravity_m_s2": 9.81,
+        "gripper_static_friction": 0.5,
+        "object_static_friction": 0.5,
+        "effective_static_friction": 0.5,
+        "tolerance_factor": 1.1,
+        "max_squeeze_force": 4.3164,
+        "consecutive_frames": 4,
+    }
     config = rte.EvaluationConfig(num_total_experiments=1, replan_steps=10)
     result = {
         "task_suite": "libero_object",
@@ -465,6 +477,9 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
         "metrics_warnings": [],
         "step_statistics": rte.summarize_step_statistics([episode]),
         "force_metric_episode_counts": {key: 0 for key in rte.FORCE_METRIC_KEYS},
+        "damage_threshold_statistics": rte.summarize_damage_threshold_statistics(
+            [episode]
+        ),
         "friction_statistics": rte.summarize_friction_statistics([episode]),
         "episodes": [episode],
         "step_trace": {"enabled": False, "path": None, "rows": 0, "status": "disabled"},
@@ -475,15 +490,24 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
     rte.save_success_rates_json([result], json_path, config)
     rte.save_success_rates_txt([result], txt_path, config)
 
-    task = json.loads(json_path.read_text())["results"]["libero_object_task1"]
+    json_result = json.loads(json_path.read_text())
+    assert json_result["metadata"]["episode_metrics_schema_version"] == 2
+    task = json_result["results"]["libero_object_task1"]
     text = txt_path.read_text()
     assert task["metrics_status"] == "complete"
     assert task["episodes"][0]["env_steps"] == 10
     assert task["episodes"][0]["friction"]["gripper"]["static_friction"] == 0.5
     assert task["friction_statistics"]["gripper"]["dynamic_friction"]["mean"] == 0.5
+    assert task["episodes"][0]["damage_threshold"]["max_squeeze_force"] == 4.3164
+    assert task["damage_threshold_statistics"]["cream_cheese_1"][
+        "max_squeeze_force"
+    ]["count"] == 1
     assert "Per-experiment step and force coverage:" in text
     assert "Friction statistics:" in text
     assert "Per-experiment friction:" in text
+    assert "Damage threshold statistics:" in text
+    assert "Per-experiment damage threshold:" in text
+    assert "cream_cheese_1 | mass_friction | 0.2000" in text
     assert "cream_cheese_1 | 0.5000 | 0.5000" in text
     assert "Per-experiment force metrics:" in text
     assert "N/A" in text

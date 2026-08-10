@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import sys
@@ -334,7 +335,9 @@ def test_damage_configuration_defaults_to_four_consecutive_frames():
 
     assert physics_config.parse_object_damage_configs(task) == {
         "tomato_sauce_1": physics_config.ObjectDamageConfig(
-            max_squeeze_force=25.0,
+            threshold=physics_config.FixedDamageThresholdConfig(
+                max_squeeze_force=25.0
+            ),
             consecutive_frames=4,
         )
     }
@@ -355,10 +358,73 @@ def test_damage_configuration_accepts_per_object_frame_override():
 
     assert physics_config.parse_object_damage_configs(task) == {
         "tomato_sauce_1": physics_config.ObjectDamageConfig(
-            max_squeeze_force=40.0,
+            threshold=physics_config.FixedDamageThresholdConfig(
+                max_squeeze_force=40.0
+            ),
             consecutive_frames=7,
         )
     }
+
+
+def test_mass_friction_damage_configuration_defaults_tolerance_factor():
+    task = _task_info()
+    task["physics"] = {
+        "gripper": {"friction": {"static": 0.5, "dynamic": 0.4}},
+        "objects": {
+            "tomato_sauce_1": {
+                "friction": {"static": 0.7, "dynamic": 0.5},
+                "damage": {"threshold": {"mode": "mass_friction"}},
+            }
+        },
+    }
+
+    assert physics_config.parse_object_damage_configs(task) == {
+        "tomato_sauce_1": physics_config.ObjectDamageConfig(
+            threshold=physics_config.MassFrictionDamageThresholdConfig(
+                tolerance_factor=1.1
+            ),
+            consecutive_frames=4,
+        )
+    }
+
+
+def test_mass_friction_damage_configuration_accepts_tolerance_override():
+    task = _task_info()
+    task["physics"] = {
+        "gripper": {"friction": 0.5},
+        "objects": {
+            "tomato_sauce_1": {
+                "friction": 0.7,
+                "damage": {
+                    "threshold": {
+                        "mode": "mass_friction",
+                        "tolerance_factor": 1.25,
+                    },
+                    "consecutive_frames": 6,
+                },
+            }
+        },
+    }
+
+    config = physics_config.parse_object_damage_configs(task)["tomato_sauce_1"]
+    assert config == physics_config.ObjectDamageConfig(
+        threshold=physics_config.MassFrictionDamageThresholdConfig(
+            tolerance_factor=1.25
+        ),
+        consecutive_frames=6,
+    )
+
+
+def test_mass_friction_damage_formula():
+    threshold = physics_config.compute_mass_friction_damage_threshold(
+        mass_kg=1.0,
+        gravity_m_s2=9.81,
+        gripper_static_friction=0.5,
+        object_static_friction=0.7,
+        tolerance_factor=1.1,
+    )
+
+    assert threshold == pytest.approx(17.985)
 
 
 @pytest.mark.parametrize(
@@ -370,6 +436,24 @@ def test_damage_configuration_accepts_per_object_frame_override():
         ({"max_squeeze_force": 10.0, "consecutive_frames": 0}, ValueError),
         ({"max_squeeze_force": 10.0, "consecutive_frames": True}, TypeError),
         ({"max_squeeze_force": 10.0, "unknown": 1}, ValueError),
+        (
+            {
+                "max_squeeze_force": 10.0,
+                "threshold": {"mode": "mass_friction"},
+            },
+            ValueError,
+        ),
+        ({"threshold": {"mode": "unknown"}}, ValueError),
+        (
+            {
+                "threshold": {
+                    "mode": "mass_friction",
+                    "tolerance_factor": 0.0,
+                }
+            },
+            ValueError,
+        ),
+        ({"threshold": {"mode": "mass_friction", "unknown": 1}}, ValueError),
     ],
 )
 def test_invalid_damage_configuration_is_rejected(damage, error_type):
@@ -391,6 +475,52 @@ def test_damage_configuration_rejects_non_target_object():
     }
 
     with pytest.raises(ValueError, match="obj_of_interest"):
+        physics_config.parse_object_damage_configs(task)
+
+
+def test_mass_friction_damage_requires_explicit_gripper_friction():
+    task = _task_info()
+    task["physics"] = {
+        "objects": {
+            "tomato_sauce_1": {
+                "friction": 0.5,
+                "damage": {"threshold": {"mode": "mass_friction"}},
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="gripper.friction"):
+        physics_config.parse_object_damage_configs(task)
+
+
+def test_mass_friction_damage_requires_explicit_object_friction():
+    task = _task_info()
+    task["physics"] = {
+        "gripper": {"friction": 0.5},
+        "objects": {
+            "tomato_sauce_1": {
+                "damage": {"threshold": {"mode": "mass_friction"}},
+            }
+        },
+    }
+
+    with pytest.raises(ValueError, match="tomato_sauce_1.friction"):
+        physics_config.parse_object_damage_configs(task)
+
+
+def test_mass_friction_damage_rejects_zero_minimum_effective_friction():
+    task = _task_info()
+    task["physics"] = {
+        "gripper": {"friction": 0.0},
+        "objects": {
+            "tomato_sauce_1": {
+                "friction": 0.0,
+                "damage": {"threshold": {"mode": "mass_friction"}},
+            }
+        },
+    }
+
+    with pytest.raises(ValueError, match="positive sum"):
         physics_config.parse_object_damage_configs(task)
 
 
@@ -438,7 +568,9 @@ def test_firm_damage_profile_matches_20k_report_values():
         object_name, threshold = expected[task_id]
         assert damage_configs == {
             object_name: physics_config.ObjectDamageConfig(
-                max_squeeze_force=threshold,
+                threshold=physics_config.FixedDamageThresholdConfig(
+                    max_squeeze_force=threshold
+                ),
                 consecutive_frames=4,
             )
         }
@@ -453,7 +585,7 @@ def test_firm_damage_profile_matches_20k_report_values():
     }
 
 
-def test_firm_fixed_friction_profile_covers_all_firm_targets():
+def test_firm_mass_friction_profile_covers_all_firm_targets():
     profile_path = (
         ROOT
         / "benchmarks/datasets/libero/config_profiles/firm_damage_fixed_friction_05_from_rlinf_sft_20k/libero_object.json"
@@ -473,4 +605,55 @@ def test_firm_fixed_friction_profile_covers_all_firm_targets():
             dynamic_friction=0.5,
         )
         assert physics_config.parse_gripper_friction_config(task) == expected
-        assert physics_config.parse_object_friction_configs(task) == {target: expected}
+        object_friction = physics_config.parse_object_friction_configs(task)
+        if task_id == 0:
+            assert object_friction == {
+                target: physics_config.UniformFrictionConfig(
+                    minimum_static_friction=0.4,
+                    maximum_static_friction=0.8,
+                    minimum_dynamic_friction=0.3,
+                    maximum_dynamic_friction=0.6,
+                    apply_on="reset",
+                    num_buckets=64,
+                )
+            }
+        else:
+            assert object_friction == {target: expected}
+        assert physics_config.parse_object_damage_configs(task) == {
+            target: physics_config.ObjectDamageConfig(
+                threshold=physics_config.MassFrictionDamageThresholdConfig(
+                    tolerance_factor=1.1
+                ),
+                consecutive_frames=4,
+            )
+        }
+
+    task0 = next(task for task in suite["tasks"] if task["task_id"] == 0)
+    assert physics_config.parse_object_mass_configs(task0) == {
+        "alphabet_soup_1": physics_config.UniformMassConfig(
+            minimum_kg=0.8,
+            maximum_kg=1.2,
+            apply_on="reset",
+        )
+    }
+    task5 = next(task for task in suite["tasks"] if task["task_id"] == 5)
+    assert physics_config.parse_object_mass_configs(task5) == {
+        "tomato_sauce_1": physics_config.UniformMassConfig(
+            minimum_kg=0.08,
+            maximum_kg=0.12,
+            apply_on="reset",
+        )
+    }
+
+    checksum_path = profile_path.with_name("libero_object.json.sha256")
+    expected_checksum = checksum_path.read_text().split()[0]
+    assert hashlib.sha256(profile_path.read_bytes()).hexdigest() == expected_checksum
+
+    threshold_provenance = json.loads(
+        profile_path.with_name("threshold_provenance.json").read_text()
+    )
+    assert threshold_provenance["schema_version"] == 2
+    assert threshold_provenance["active_derivation"]["mode"] == "mass_friction"
+    assert threshold_provenance["superseded_manual_thresholds"]["values"]["0"][
+        "max_squeeze_force"
+    ] == 73.726

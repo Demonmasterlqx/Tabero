@@ -101,12 +101,84 @@ def extract_object_damage_details(
             return None
         return value
 
+    def optional_float(value: Any) -> float | None:
+        value = scalar(value)
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) else None
+
+    max_squeeze_force = optional_float(raw.get("max_squeeze_force"))
+    consecutive_count = scalar(raw.get("consecutive_count"))
+    measured_squeeze_force = optional_float(raw.get("measured_squeeze_force"))
+    if max_squeeze_force is None or consecutive_count is None or measured_squeeze_force is None:
+        return None
+
     return {
         "object_name": object_name,
-        "max_squeeze_force": float(raw["max_squeeze_force"]),
+        "mode": str(raw.get("mode", "fixed")),
+        "mass_kg": optional_float(raw.get("mass_kg")),
+        "gravity_m_s2": optional_float(raw.get("gravity_m_s2")),
+        "gripper_static_friction": optional_float(raw.get("gripper_static_friction")),
+        "object_static_friction": optional_float(raw.get("object_static_friction")),
+        "effective_static_friction": optional_float(raw.get("effective_static_friction")),
+        "tolerance_factor": optional_float(raw.get("tolerance_factor")),
+        "max_squeeze_force": max_squeeze_force,
         "consecutive_frames": int(raw["consecutive_frames"]),
-        "consecutive_count": int(scalar(raw.get("consecutive_count"))),
-        "measured_squeeze_force": float(scalar(raw.get("measured_squeeze_force"))),
+        "consecutive_count": int(consecutive_count),
+        "measured_squeeze_force": measured_squeeze_force,
+    }
+
+
+def extract_damage_threshold_snapshot(
+    *, info: Any, env_index: int = 0
+) -> dict[str, Any] | None:
+    """Extract the reset-time damage-threshold calculation for one LIBERO object."""
+
+    root = info.get("object_damage_threshold", {}) if isinstance(info, dict) else {}
+    if not isinstance(root, dict) or not root:
+        return None
+
+    object_name = sorted(root)[0]
+    raw = root.get(object_name)
+    if not isinstance(raw, dict):
+        return None
+
+    def scalar(value: Any) -> Any:
+        try:
+            if hasattr(value, "detach"):
+                value = value.detach()
+            if hasattr(value, "reshape"):
+                value = value.reshape(-1)[env_index]
+            if hasattr(value, "item"):
+                value = value.item()
+        except (IndexError, TypeError, ValueError):
+            return None
+        return value
+
+    def optional_float(value: Any) -> float | None:
+        value = scalar(value)
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) else None
+
+    max_squeeze_force = optional_float(raw.get("max_squeeze_force"))
+    if max_squeeze_force is None:
+        return None
+    return {
+        "object_name": object_name,
+        "mode": str(raw.get("mode", "fixed")),
+        "mass_kg": optional_float(raw.get("mass_kg")),
+        "gravity_m_s2": optional_float(raw.get("gravity_m_s2")),
+        "gripper_static_friction": optional_float(raw.get("gripper_static_friction")),
+        "object_static_friction": optional_float(raw.get("object_static_friction")),
+        "effective_static_friction": optional_float(raw.get("effective_static_friction")),
+        "tolerance_factor": optional_float(raw.get("tolerance_factor")),
+        "max_squeeze_force": max_squeeze_force,
+        "consecutive_frames": int(raw.get("consecutive_frames", 4)),
     }
 
 
@@ -192,6 +264,44 @@ def summarize_friction_statistics(episodes: Sequence[dict[str, Any]]) -> dict[st
                 "max": max(values) if values else None,
             }
         result[scope_name] = scope_summary
+    return result
+
+
+def summarize_damage_threshold_statistics(
+    episodes: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize reset-time mass, effective friction, and damage threshold by object."""
+
+    fields = ("mass_kg", "effective_static_friction", "max_squeeze_force")
+    objects: dict[str, dict[str, list[float]]] = {}
+    for episode in episodes:
+        snapshot = episode.get("damage_threshold")
+        if not isinstance(snapshot, dict):
+            continue
+        object_name = snapshot.get("object_name")
+        if not isinstance(object_name, str):
+            continue
+        values = objects.setdefault(object_name, {field: [] for field in fields})
+        for field in fields:
+            value = snapshot.get(field)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+            ):
+                values[field].append(float(value))
+
+    result: dict[str, Any] = {}
+    for object_name, values_by_field in sorted(objects.items()):
+        result[object_name] = {
+            field: {
+                "count": len(values),
+                "mean": _mean_or_none(values),
+                "min": min(values) if values else None,
+                "max": max(values) if values else None,
+            }
+            for field, values in values_by_field.items()
+        }
     return result
 
 

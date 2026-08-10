@@ -60,11 +60,43 @@ FrictionConfig = FixedFrictionConfig | UniformFrictionConfig
 
 
 @dataclass(frozen=True)
+class FixedDamageThresholdConfig:
+    """Use one manually configured squeeze-force damage threshold."""
+
+    max_squeeze_force: float
+
+
+@dataclass(frozen=True)
+class MassFrictionDamageThresholdConfig:
+    """Derive the squeeze-force limit from reset-time mass and static friction."""
+
+    tolerance_factor: float = 1.1
+
+
+DamageThresholdConfig = FixedDamageThresholdConfig | MassFrictionDamageThresholdConfig
+
+
+@dataclass(frozen=True)
 class ObjectDamageConfig:
     """Terminate when measured object-specific squeeze stays above a limit."""
 
-    max_squeeze_force: float
+    threshold: DamageThresholdConfig
     consecutive_frames: int = 4
+
+
+def compute_mass_friction_damage_threshold(
+    mass_kg: Any,
+    gravity_m_s2: Any,
+    gripper_static_friction: Any,
+    object_static_friction: Any,
+    tolerance_factor: Any = 1.1,
+) -> Any:
+    """Compute ``m*g/mean(mu_gripper, mu_object)*k`` for scalars or tensors."""
+
+    effective_friction = 0.5 * (
+        gripper_static_friction + object_static_friction
+    )
+    return mass_kg * gravity_m_s2 / effective_friction * tolerance_factor
 
 
 def _positive_finite_number(value: Any, field_name: str) -> float:
@@ -362,6 +394,16 @@ def parse_object_damage_configs(task_info: dict[str, Any]) -> dict[str, ObjectDa
             "consecutive_frames": <positive integer, default 4>,
         }
 
+    or::
+
+        physics.objects.<object_name>.damage = {
+            "threshold": {
+                "mode": "mass_friction",
+                "tolerance_factor": <positive finite number, default 1.1>,
+            },
+            "consecutive_frames": <positive integer, default 4>,
+        }
+
     Damage may only be configured for an object listed in ``obj_of_interest``.
     Missing damage configuration is a strict no-op.
     """
@@ -403,18 +445,79 @@ def parse_object_damage_configs(task_info: dict[str, Any]) -> dict[str, ObjectDa
         if not isinstance(damage_value, dict):
             raise TypeError(f"{field_name} must be an object.")
 
-        supported_keys = {"max_squeeze_force", "consecutive_frames"}
+        supported_keys = {"max_squeeze_force", "threshold", "consecutive_frames"}
         unknown_keys = sorted(set(damage_value) - supported_keys)
         if unknown_keys:
             raise ValueError(f"{field_name} has unsupported keys: {unknown_keys}.")
-        if "max_squeeze_force" not in damage_value:
-            raise ValueError(f"{field_name}.max_squeeze_force is required.")
+
+        has_fixed_threshold = "max_squeeze_force" in damage_value
+        has_derived_threshold = "threshold" in damage_value
+        if has_fixed_threshold == has_derived_threshold:
+            raise ValueError(
+                f"{field_name} must define exactly one of max_squeeze_force or threshold."
+            )
+
+        if has_fixed_threshold:
+            threshold: DamageThresholdConfig = FixedDamageThresholdConfig(
+                max_squeeze_force=_positive_finite_number(
+                    damage_value["max_squeeze_force"],
+                    f"{field_name}.max_squeeze_force",
+                )
+            )
+        else:
+            threshold_value = damage_value["threshold"]
+            threshold_field = f"{field_name}.threshold"
+            if not isinstance(threshold_value, dict):
+                raise TypeError(f"{threshold_field} must be an object.")
+            unknown_threshold_keys = sorted(
+                set(threshold_value) - {"mode", "tolerance_factor"}
+            )
+            if unknown_threshold_keys:
+                raise ValueError(
+                    f"{threshold_field} has unsupported keys: {unknown_threshold_keys}."
+                )
+            mode = threshold_value.get("mode")
+            if mode != "mass_friction":
+                raise ValueError(
+                    f"{threshold_field}.mode must be 'mass_friction', got {mode!r}."
+                )
+            threshold = MassFrictionDamageThresholdConfig(
+                tolerance_factor=_positive_finite_number(
+                    threshold_value.get("tolerance_factor", 1.1),
+                    f"{threshold_field}.tolerance_factor",
+                )
+            )
+
+            gripper_friction = parse_gripper_friction_config(task_info)
+            object_friction = parse_object_friction_configs(task_info).get(object_name)
+            if gripper_friction is None:
+                raise ValueError(
+                    f"{field_name} mass_friction mode requires task.physics.gripper.friction."
+                )
+            if object_friction is None:
+                raise ValueError(
+                    f"{field_name} mass_friction mode requires "
+                    f"task.physics.objects.{object_name}.friction."
+                )
+
+            gripper_minimum = (
+                gripper_friction.static_friction
+                if isinstance(gripper_friction, FixedFrictionConfig)
+                else gripper_friction.minimum_static_friction
+            )
+            object_minimum = (
+                object_friction.static_friction
+                if isinstance(object_friction, FixedFrictionConfig)
+                else object_friction.minimum_static_friction
+            )
+            if gripper_minimum + object_minimum <= 0.0:
+                raise ValueError(
+                    f"{field_name} mass_friction mode requires the minimum gripper and "
+                    "object static-friction coefficients to have a positive sum."
+                )
 
         configs[object_name] = ObjectDamageConfig(
-            max_squeeze_force=_positive_finite_number(
-                damage_value["max_squeeze_force"],
-                f"{field_name}.max_squeeze_force",
-            ),
+            threshold=threshold,
             consecutive_frames=_positive_integer(
                 damage_value.get("consecutive_frames", 4),
                 f"{field_name}.consecutive_frames",

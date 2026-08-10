@@ -243,7 +243,7 @@ Task 级 JSON/TXT 同时记录每个 scope 的 count/mean/min/max，便于检查
 }
 ```
 
-- `max_squeeze_force` 必填，必须为有限正数。
+- 手动模式使用 `max_squeeze_force`，该值必须为有限正数。
 - `consecutive_frames` 可选，默认为 `4`，必须为正整数。
 - 当实测夹持力连续 `consecutive_frames` 个 environment steps 严格大于上限时，
   在最后一帧触发 `object_damage_<object_name>` termination。
@@ -257,6 +257,49 @@ Task 级 JSON/TXT 同时记录每个 scope 的 count/mean/min/max，便于检查
 - damage 只允许配置在 Task 的 `obj_of_interest` 对象上。配置到 basket、fixture
   或未知对象会在环境创建前报错。
 - 未配置 `damage` 的 Task 不创建 damage terminal，保持原行为。
+
+也可以让上限在每次 reset 时根据本轮实际质量和静摩擦系数计算：
+
+```json
+{
+  "physics": {
+    "gripper": {
+      "friction": {"static": 0.5, "dynamic": 0.5}
+    },
+    "objects": {
+      "tomato_sauce_1": {
+        "friction": {"static": 0.7, "dynamic": 0.5},
+        "damage": {
+          "threshold": {
+            "mode": "mass_friction",
+            "tolerance_factor": 1.1
+          },
+          "consecutive_frames": 4
+        }
+      }
+    }
+  }
+}
+```
+
+计算公式为：
+
+```text
+effective_static_friction = (gripper_static_friction + object_static_friction) / 2
+max_squeeze_force = mass_kg * gravity_m_s2 / effective_static_friction * tolerance_factor
+```
+
+- `tolerance_factor` 默认为 `1.1`，必须为有限正数。
+- `max_squeeze_force` 与 `threshold` 必须且只能配置一个。
+- 计算模式要求显式配置 `physics.gripper.friction` 和目标物体的 `friction`。
+- 质量读取 reset 后 PhysX 中的实际值；未配置 `mass_kg` 时使用 USD/PhysX 默认质量，
+  配置 reset 随机化时使用本轮采样质量。
+- 静摩擦读取 Tabero 摩擦事件在本轮实际应用的值；双方最小静摩擦之和必须大于零。
+- 重力使用当前仿真重力向量的模，默认约为 `9.81 m/s²`。
+- IsaacLab 先完成 reset 质量/摩擦事件，再重置 terminal，因此公式只在每次 reset
+  计算一次，episode 中保持不变。
+- raw JSON/TXT 会记录每个 episode 的质量、双方静摩擦、有效静摩擦、容忍系数和
+  最终 threshold，并汇总 count/mean/min/max。
 
 OpenPI evaluator 保留该 terminal，并在 raw episode metrics 中记录：
 

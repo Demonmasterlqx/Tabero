@@ -1,23 +1,34 @@
 {
   "profile": "firm_damage_fixed_friction_05_from_rlinf_sft_20k",
-  "purpose": "Explicitly exercise Tabero gripper/object friction configuration during the formal Firm evaluation without changing the previous default coefficient.",
+  "purpose": "Provide explicit reset-time friction values used by the mass-friction damage-threshold calculation.",
   "task_ids": [0, 1, 2, 3, 5, 6, 7, 8, 9],
   "gripper": {
     "static_friction": 0.5,
     "dynamic_friction": 0.5,
-    "scope": ["panda_leftfinger", "panda_rightfinger"]
+    "scope": ["panda_leftfinger", "panda_rightfinger"],
+    "apply_on": "startup"
   },
   "objects": {
-    "scope": "each task obj_of_interest",
-    "static_friction": 0.5,
-    "dynamic_friction": 0.5
+    "default": {
+      "scope": "each Firm task obj_of_interest except Task 0",
+      "static_friction": 0.5,
+      "dynamic_friction": 0.5,
+      "apply_on": "startup"
+    },
+    "task_0": {
+      "object": "alphabet_soup_1",
+      "distribution": "uniform",
+      "static_range": [0.4, 0.8],
+      "dynamic_range": [0.3, 0.6],
+      "apply_on": "reset",
+      "num_buckets": 64
+    }
   },
-  "apply_on": "startup",
   "task_4": "unchanged and excluded from the Firm evaluation subset",
   "notes": [
-    "The values match the previous IsaacLab default rigid-body material coefficient.",
-    "Uniform friction randomization is validated separately with a runtime smoke profile.",
+    "The directory name is retained for compatibility with existing libero_config_dir paths.",
+    "Task 0 preserves the user-configured random mass and friction ranges.",
     "Task 5 retains reset-time mass randomization in [0.08, 0.12] kg.",
-    "Damage thresholds and consecutive_frames=4 are inherited unchanged from firm_damage_from_rlinf_sft_20k."
+    "Damage thresholds are now derived from reset-time mass, static friction, gravity, and tolerance factor."
   ]
 }

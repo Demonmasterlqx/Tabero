@@ -27,6 +27,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from benchmarks.common.episode_metrics import (
     FORCE_METRIC_KEYS,
     aggregate_success_force_metrics,
+    summarize_damage_threshold_statistics,
     summarize_friction_statistics,
     summarize_step_statistics,
     validate_episode_records,
@@ -538,6 +539,7 @@ def collect_episode_metric_artifacts(
         "metrics_warnings": metrics_warnings,
         "step_statistics": summarize_step_statistics(episodes),
         "force_metric_episode_counts": force_metric_episode_counts,
+        "damage_threshold_statistics": summarize_damage_threshold_statistics(episodes),
         "friction_statistics": summarize_friction_statistics(episodes),
         "episodes": episodes,
         "step_trace": step_trace,
@@ -820,7 +822,7 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "task_environment": config.task if config.task else "auto",
             "num_total_experiments": config.num_total_experiments,
             "num_success_steps": config.num_success_steps,
-            "episode_metrics_schema_version": 1,
+            "episode_metrics_schema_version": 2,
             "replan_steps": config.replan_steps,
             "record_step_traces": config.record_step_traces,
             "step_trace_dir": str(config.step_trace_dir) if config.step_trace_dir is not None else None,
@@ -876,6 +878,9 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "step_statistics": result.get("step_statistics", summarize_step_statistics([])),
             "force_metric_episode_counts": result.get(
                 "force_metric_episode_counts", {key: 0 for key in FORCE_METRIC_KEYS}
+            ),
+            "damage_threshold_statistics": result.get(
+                "damage_threshold_statistics", {}
             ),
             "friction_statistics": result.get("friction_statistics", {}),
             "episodes": result.get("episodes", []),
@@ -978,6 +983,36 @@ def _write_episode_metrics_txt(output, result: dict) -> None:
                 + "\n"
             )
 
+    damage_threshold_statistics = result.get("damage_threshold_statistics", {})
+    output.write("    Damage threshold statistics:\n")
+    if not damage_threshold_statistics:
+        output.write("      N/A\n")
+    else:
+        output.write(
+            "      object | field | count | mean | min | max\n"
+        )
+        for object_name, fields in sorted(damage_threshold_statistics.items()):
+            for field_name in (
+                "mass_kg",
+                "effective_static_friction",
+                "max_squeeze_force",
+            ):
+                summary = fields.get(field_name, {})
+                output.write(
+                    "      "
+                    + " | ".join(
+                        [
+                            str(object_name),
+                            field_name,
+                            _txt_value(summary.get("count")),
+                            _txt_value(summary.get("mean")),
+                            _txt_value(summary.get("min")),
+                            _txt_value(summary.get("max")),
+                        ]
+                    )
+                    + "\n"
+                )
+
     episodes = result.get("episodes", [])
     output.write("    Per-experiment step and force coverage:\n")
     output.write(
@@ -1013,6 +1048,35 @@ def _write_episode_metrics_txt(output, result: dict) -> None:
                     pred_contact,
                     meas_contact,
                     _txt_value(samples.get("coverage_ratio"), precision=3),
+                ]
+            )
+            + "\n"
+        )
+
+    output.write("    Per-experiment damage threshold:\n")
+    output.write(
+        "      exp | object_name | mode | mass_kg | gravity_m_s2 | gripper_static | "
+        "object_static | effective_static | tolerance_factor | max_squeeze_force | consecutive_frames\n"
+    )
+    if not episodes:
+        output.write("      N/A\n")
+    for episode in episodes:
+        threshold = episode.get("damage_threshold") or {}
+        output.write(
+            "      "
+            + " | ".join(
+                [
+                    _txt_value(episode.get("experiment_index")),
+                    _txt_value(threshold.get("object_name")),
+                    _txt_value(threshold.get("mode")),
+                    _txt_value(threshold.get("mass_kg")),
+                    _txt_value(threshold.get("gravity_m_s2")),
+                    _txt_value(threshold.get("gripper_static_friction")),
+                    _txt_value(threshold.get("object_static_friction")),
+                    _txt_value(threshold.get("effective_static_friction")),
+                    _txt_value(threshold.get("tolerance_factor")),
+                    _txt_value(threshold.get("max_squeeze_force")),
+                    _txt_value(threshold.get("consecutive_frames")),
                 ]
             )
             + "\n"

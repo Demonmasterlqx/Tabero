@@ -1,18 +1,21 @@
-# Firm damage + explicit fixed friction 0.5
+# Firm mass-friction damage threshold profile
 
 This profile extends `firm_damage_from_rlinf_sft_20k` for Firm Tasks
 `0,1,2,3,5,6,7,8,9`.
 
 - Both Franka finger bodies use static/dynamic friction `0.5/0.5`.
-- Each Task's `obj_of_interest` uses static/dynamic friction `0.5/0.5`.
+- Task 0 samples object static friction in `[0.4, 0.8]`, dynamic friction in
+  `[0.3, 0.6]`, and mass in `[0.8, 1.2] kg` on every reset.
+- Other Firm targets use static/dynamic friction `0.5/0.5`.
 - Task 5 retains reset-time mass randomization in `[0.08, 0.12] kg`.
-- Object-damage thresholds and `consecutive_frames=4` are unchanged.
+- Every Firm target derives its damage threshold at reset as
+  `mass * |gravity| / mean(gripper_static, object_static) * 1.1`.
+- `consecutive_frames=4` remains unchanged.
 - Task 4 remains unchanged and is not part of this Firm evaluation subset.
 
-The fixed value deliberately matches the previous IsaacLab default material.
-This formal profile therefore exercises the explicit Tabero friction path without
-introducing an arbitrary new perturbation magnitude. Uniform randomization is
-validated separately by a runtime smoke.
+The directory name is retained so existing Tabero and RLinf configuration paths do
+not change. The original report-derived manual thresholds remain documented in
+`threshold_provenance.json` as superseded historical inputs.
 
 Direct Tabero evaluation:
 

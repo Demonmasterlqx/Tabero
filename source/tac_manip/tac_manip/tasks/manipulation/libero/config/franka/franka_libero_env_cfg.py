@@ -39,8 +39,10 @@ from isaaclab_tasks.manager_based.manipulation.stack.mdp import franka_stack_eve
 
 from tac_manip.tasks.manipulation.libero import mdp
 from tac_manip.tasks.manipulation.libero.physics_config import (
+    FixedDamageThresholdConfig,
     FixedFrictionConfig,
     FixedMassConfig,
+    MassFrictionDamageThresholdConfig,
     UniformFrictionConfig,
     UniformMassConfig,
     parse_gripper_friction_config,
@@ -408,6 +410,24 @@ class TerminationsCfg:
             )
 
         for object_name, damage_cfg in libero_config.object_damage_configs.items():
+            threshold_cfg = damage_cfg.threshold
+            if isinstance(threshold_cfg, FixedDamageThresholdConfig):
+                threshold_params = {
+                    "threshold_mode": "fixed",
+                    "max_squeeze_force": threshold_cfg.max_squeeze_force,
+                    "tolerance_factor": 1.1,
+                }
+            elif isinstance(threshold_cfg, MassFrictionDamageThresholdConfig):
+                threshold_params = {
+                    "threshold_mode": "mass_friction",
+                    "max_squeeze_force": None,
+                    "tolerance_factor": threshold_cfg.tolerance_factor,
+                }
+            else:
+                raise TypeError(
+                    f"Unsupported damage threshold config for {object_name!r}: "
+                    f"{type(threshold_cfg)!r}."
+                )
             setattr(
                 self,
                 f"object_damage_{object_name}",
@@ -416,8 +436,8 @@ class TerminationsCfg:
                     params={
                         "object_name": object_name,
                         "contact_sensor_name": f"contact_grasp_{object_name}",
-                        "max_squeeze_force": damage_cfg.max_squeeze_force,
                         "consecutive_frames": damage_cfg.consecutive_frames,
+                        **threshold_params,
                     },
                 ),
             )
