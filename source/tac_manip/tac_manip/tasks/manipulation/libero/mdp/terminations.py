@@ -170,6 +170,40 @@ class object_damage_from_squeeze(ManagerTermBase):
             )
         return selected.to(device=self._env.device)
 
+    def _read_rigid_object_mass(
+        self,
+        env_ids_cpu: torch.Tensor,
+        *,
+        required: bool,
+    ) -> torch.Tensor | None:
+        """Read reset-time PhysX mass when the target is a one-body rigid object."""
+
+        asset = self._env.scene[self._object_name]
+        if not isinstance(asset, RigidObject) or asset.num_bodies != 1:
+            if required:
+                raise RuntimeError(
+                    f"Mass-friction damage threshold for {self._object_name!r} requires "
+                    "a one-body RigidObject asset."
+                )
+            return None
+        masses = asset.root_physx_view.get_masses().reshape(self._env.num_envs, -1)
+        if masses.shape[1] != 1:
+            if required:
+                raise RuntimeError(
+                    f"Mass-friction damage threshold for {self._object_name!r} expected "
+                    f"one mass per environment, got shape {tuple(masses.shape)}."
+                )
+            return None
+        mass_kg = masses[env_ids_cpu, 0].to(
+            device=self._env.device, dtype=torch.float32
+        )
+        if not torch.all(torch.isfinite(mass_kg)) or torch.any(mass_kg <= 0.0):
+            raise RuntimeError(
+                f"Damage threshold for object {self._object_name!r} received invalid "
+                f"reset-time masses: {mass_kg.tolist()}."
+            )
+        return mass_kg
+
     def _store_threshold_snapshot(
         self,
         env_ids_device: torch.Tensor,
@@ -224,28 +258,15 @@ class object_damage_from_squeeze(ManagerTermBase):
                     f"Damage threshold for object {self._object_name!r} must be finite "
                     f"and positive, got {threshold!r}."
                 )
+            # Fixed thresholds do not depend on mass, but retaining the actual
+            # reset-time PhysX mass makes randomized-physics ablations auditable.
+            mass_kg = self._read_rigid_object_mass(env_ids_cpu, required=False)
+            if mass_kg is not None:
+                self._mass_kg[env_ids_device] = mass_kg
             self._max_squeeze_force[env_ids_device] = threshold
         else:
-            asset = self._env.scene[self._object_name]
-            if not isinstance(asset, RigidObject) or asset.num_bodies != 1:
-                raise RuntimeError(
-                    f"Mass-friction damage threshold for {self._object_name!r} requires "
-                    "a one-body RigidObject asset."
-                )
-            masses = asset.root_physx_view.get_masses().reshape(self._env.num_envs, -1)
-            if masses.shape[1] != 1:
-                raise RuntimeError(
-                    f"Mass-friction damage threshold for {self._object_name!r} expected "
-                    f"one mass per environment, got shape {tuple(masses.shape)}."
-                )
-            mass_kg = masses[env_ids_cpu, 0].to(
-                device=self._env.device, dtype=torch.float32
-            )
-            if not torch.all(torch.isfinite(mass_kg)) or torch.any(mass_kg <= 0.0):
-                raise RuntimeError(
-                    f"Mass-friction damage threshold for {self._object_name!r} received "
-                    f"invalid reset-time masses: {mass_kg.tolist()}."
-                )
+            mass_kg = self._read_rigid_object_mass(env_ids_cpu, required=True)
+            assert mass_kg is not None
 
             gravity = tuple(float(value) for value in self._env.cfg.sim.gravity)
             gravity_m_s2 = math.sqrt(sum(value * value for value in gravity))

@@ -657,3 +657,172 @@ def test_firm_mass_friction_profile_covers_all_firm_targets():
     assert threshold_provenance["superseded_manual_thresholds"]["values"]["0"][
         "max_squeeze_force"
     ] == 73.726
+
+
+def test_alltask_uniform_mass_friction_damage_profile_covers_every_target():
+    profile_path = (
+        ROOT
+        / "benchmarks/datasets/libero/config_profiles/"
+        "alltask_damage_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k/"
+        "libero_object.json"
+    )
+    suite = json.loads(profile_path.read_text())
+    expected_targets = {
+        0: "alphabet_soup_1",
+        1: "cream_cheese_1",
+        2: "salad_dressing_1",
+        3: "bbq_sauce_1",
+        4: "ketchup_1",
+        5: "tomato_sauce_1",
+        6: "butter_1",
+        7: "milk_1",
+        8: "chocolate_pudding_1",
+        9: "orange_juice_1",
+    }
+    expected_mass = physics_config.UniformMassConfig(
+        minimum_kg=0.5,
+        maximum_kg=1.6,
+        apply_on="reset",
+    )
+    expected_object_friction = physics_config.UniformFrictionConfig(
+        minimum_static_friction=0.4,
+        maximum_static_friction=0.8,
+        minimum_dynamic_friction=0.3,
+        maximum_dynamic_friction=0.6,
+        apply_on="reset",
+        num_buckets=64,
+    )
+    expected_gripper_friction = physics_config.FixedFrictionConfig(
+        static_friction=0.5,
+        dynamic_friction=0.5,
+    )
+
+    assert {task["task_id"] for task in suite["tasks"]} == set(expected_targets)
+    for task in suite["tasks"]:
+        task_id = task["task_id"]
+        target = expected_targets[task_id]
+        assert task["obj_of_interest"] == [target]
+        assert physics_config.parse_object_mass_configs(task) == {
+            target: expected_mass
+        }
+        assert physics_config.parse_object_friction_configs(task) == {
+            target: expected_object_friction
+        }
+        assert (
+            physics_config.parse_gripper_friction_config(task)
+            == expected_gripper_friction
+        )
+        assert physics_config.parse_object_damage_configs(task) == {
+            target: physics_config.ObjectDamageConfig(
+                threshold=physics_config.MassFrictionDamageThresholdConfig(
+                    tolerance_factor=1.1
+                ),
+                consecutive_frames=4,
+            )
+        }
+
+    checksum_path = profile_path.with_name("libero_object.json.sha256")
+    expected_checksum = checksum_path.read_text().split()[0]
+    assert hashlib.sha256(profile_path.read_bytes()).hexdigest() == expected_checksum
+
+    friction_provenance = json.loads(
+        profile_path.with_name("friction_provenance.json").read_text()
+    )
+    assert friction_provenance["task_ids"] == list(range(10))
+    assert friction_provenance["objects"]["static_range"] == [0.4, 0.8]
+    assert friction_provenance["objects"]["dynamic_range"] == [0.3, 0.6]
+
+    threshold_provenance = json.loads(
+        profile_path.with_name("threshold_provenance.json").read_text()
+    )
+    assert threshold_provenance["active_derivation"]["mode"] == "mass_friction"
+    assert set(threshold_provenance["tasks"]) == {str(task_id) for task_id in range(10)}
+    assert threshold_provenance["formal_physical_damage_calibration"] is False
+
+
+def test_alltask_fixed_high_damage_profile_preserves_uniform_random_physics():
+    profile_path = (
+        ROOT
+        / "benchmarks/datasets/libero/config_profiles/"
+        "alltask_fixed_damage_1000000_uniform_mass_05_16_friction_04_08_"
+        "from_rlinf_sft_20k/libero_object.json"
+    )
+    suite = json.loads(profile_path.read_text())
+    expected_targets = {
+        0: "alphabet_soup_1",
+        1: "cream_cheese_1",
+        2: "salad_dressing_1",
+        3: "bbq_sauce_1",
+        4: "ketchup_1",
+        5: "tomato_sauce_1",
+        6: "butter_1",
+        7: "milk_1",
+        8: "chocolate_pudding_1",
+        9: "orange_juice_1",
+    }
+    expected_mass = physics_config.UniformMassConfig(
+        minimum_kg=0.5,
+        maximum_kg=1.6,
+        apply_on="reset",
+    )
+    expected_object_friction = physics_config.UniformFrictionConfig(
+        minimum_static_friction=0.4,
+        maximum_static_friction=0.8,
+        minimum_dynamic_friction=0.3,
+        maximum_dynamic_friction=0.6,
+        apply_on="reset",
+        num_buckets=64,
+    )
+    expected_gripper_friction = physics_config.FixedFrictionConfig(
+        static_friction=0.5,
+        dynamic_friction=0.5,
+    )
+    expected_damage = physics_config.FixedDamageThresholdConfig(
+        max_squeeze_force=1_000_000.0
+    )
+
+    assert {task["task_id"] for task in suite["tasks"]} == set(expected_targets)
+    for task in suite["tasks"]:
+        target = expected_targets[task["task_id"]]
+        assert task["obj_of_interest"] == [target]
+        assert physics_config.parse_object_mass_configs(task) == {
+            target: expected_mass
+        }
+        assert physics_config.parse_object_friction_configs(task) == {
+            target: expected_object_friction
+        }
+        assert (
+            physics_config.parse_gripper_friction_config(task)
+            == expected_gripper_friction
+        )
+        assert physics_config.parse_object_damage_configs(task) == {
+            target: physics_config.ObjectDamageConfig(
+                threshold=expected_damage,
+                consecutive_frames=4,
+            )
+        }
+
+    checksum_path = profile_path.with_name("libero_object.json.sha256")
+    expected_checksum = checksum_path.read_text().split()[0]
+    assert hashlib.sha256(profile_path.read_bytes()).hexdigest() == expected_checksum
+
+    threshold_provenance = json.loads(
+        profile_path.with_name("threshold_provenance.json").read_text()
+    )
+    assert threshold_provenance["active_derivation"] == {
+        "mode": "fixed",
+        "max_squeeze_force": 1_000_000.0,
+        "consecutive_frames": 4,
+        "purpose": (
+            "Keep the damage terminal installed while making its limit inactive "
+            "over the benchmark's observed force range"
+        ),
+        "validity_rule": (
+            "Any object-damage trigger invalidates the no-damage-limit baseline "
+            "interpretation"
+        ),
+    }
+    assert set(threshold_provenance["tasks"]) == {
+        str(task_id) for task_id in range(10)
+    }
+    assert threshold_provenance["formal_physical_damage_calibration"] is False

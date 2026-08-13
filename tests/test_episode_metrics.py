@@ -186,6 +186,39 @@ def test_extract_mass_friction_damage_threshold_snapshot_is_json_safe():
     }
 
 
+def test_extract_fixed_damage_threshold_snapshot_keeps_audited_random_mass():
+    snapshot = extract_damage_threshold_snapshot(
+        info={
+            "object_damage_threshold": {
+                "tomato_sauce_1": {
+                    "mode": "fixed",
+                    "mass_kg": np.asarray([1.25]),
+                    "gravity_m_s2": np.asarray([np.nan]),
+                    "gripper_static_friction": np.asarray([np.nan]),
+                    "object_static_friction": np.asarray([np.nan]),
+                    "effective_static_friction": np.asarray([np.nan]),
+                    "tolerance_factor": None,
+                    "max_squeeze_force": np.asarray([1_000_000.0]),
+                    "consecutive_frames": 4,
+                }
+            }
+        }
+    )
+
+    assert snapshot == {
+        "object_name": "tomato_sauce_1",
+        "mode": "fixed",
+        "mass_kg": pytest.approx(1.25),
+        "gravity_m_s2": None,
+        "gripper_static_friction": None,
+        "object_static_friction": None,
+        "effective_static_friction": None,
+        "tolerance_factor": None,
+        "max_squeeze_force": pytest.approx(1_000_000.0),
+        "consecutive_frames": 4,
+    }
+
+
 def test_summarize_damage_threshold_statistics_tracks_reset_values():
     episodes = [
         {
