@@ -26,6 +26,158 @@ FORCE_METRIC_KEYS = (
     "ap_max_meas",
 )
 
+TRAJECTORY_FORCE_STATUSES = frozenset(
+    {
+        "complete",
+        "insufficient_samples",
+        "no_valid_samples",
+        "grasp_not_started",
+        "unavailable",
+        "error",
+    }
+)
+
+
+def _scalar_bool(value: Any, *, field_name: str) -> bool:
+    """Convert one tensor/array/scalar grasp observation to bool."""
+
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    array = np.asarray(value)
+    if array.size != 1:
+        raise ValueError(
+            f"{field_name} must contain exactly one environment value, got shape "
+            f"{array.shape}"
+        )
+    return bool(array.reshape(-1)[0])
+
+
+class TrajectoryForceTracker:
+    """Track the measured squeeze samples used by RLinf's success force bonus.
+
+    The grasp observation is latched per source. A sample is valid only after a
+    grasp has started, both fingers exceed ``contact_epsilon_n`` in force norm,
+    and the raw two-finger squeeze exceeds the same threshold. The force input
+    is the current, unfiltered gripper-local ``(left, right) x (x, y, z)`` force.
+    """
+
+    def __init__(
+        self,
+        grasp_term_names: Sequence[str],
+        *,
+        contact_epsilon_n: float,
+        min_valid_samples: int,
+    ) -> None:
+        names = tuple(str(name) for name in grasp_term_names)
+        if not names or any(not name.startswith("grasp_") for name in names):
+            raise ValueError("grasp_term_names must contain at least one grasp_<n> term")
+        if len(set(names)) != len(names):
+            raise ValueError("grasp_term_names must not contain duplicates")
+        if not math.isfinite(contact_epsilon_n) or contact_epsilon_n < 0.0:
+            raise ValueError("contact_epsilon_n must be finite and non-negative")
+        if type(min_valid_samples) is not int or min_valid_samples < 1:
+            raise ValueError("min_valid_samples must be a positive integer")
+
+        self.grasp_term_names = names
+        self.contact_epsilon_n = float(contact_epsilon_n)
+        self.min_valid_samples = int(min_valid_samples)
+        self.reset()
+
+    def reset(self) -> None:
+        self._grasp_started_by_source = {
+            name: False for name in self.grasp_term_names
+        }
+        self._grasp_start_step: int | None = None
+        self._force_sum = 0.0
+        self._valid_samples = 0
+
+    def update(
+        self,
+        *,
+        step_index: int,
+        grasp_observations: dict[str, Any],
+        force_lr_raw: Any,
+    ) -> dict[str, Any]:
+        """Consume one post-``env.step`` state and return trace-ready fields."""
+
+        if type(step_index) is not int or step_index < 0:
+            raise ValueError("step_index must be a non-negative integer")
+        if not isinstance(grasp_observations, dict):
+            raise ValueError("subtask_terms observations must be a dictionary")
+
+        grasp_observed = False
+        active_terms: list[str] = []
+        for name in self.grasp_term_names:
+            if name not in grasp_observations:
+                raise ValueError(f"missing grasp observation {name!r}")
+            grasped = _scalar_bool(grasp_observations[name], field_name=name)
+            grasp_observed |= grasped
+            if grasped:
+                active_terms.append(name)
+                self._grasp_started_by_source[name] = True
+        if grasp_observed and self._grasp_start_step is None:
+            self._grasp_start_step = int(step_index)
+
+        force_lr = np.asarray(force_lr_raw, dtype=np.float64)
+        if force_lr.shape != (2, 3):
+            raise ValueError(
+                "raw gripper force must have shape (2, 3), got "
+                f"{force_lr.shape}"
+            )
+        if not np.all(np.isfinite(force_lr)):
+            raise ValueError("raw gripper force contains non-finite values")
+
+        finger_norms = np.linalg.norm(force_lr, axis=-1)
+        raw_squeeze = 2.0 * min(abs(force_lr[0, 2]), abs(force_lr[1, 2]))
+        grasp_started = any(self._grasp_started_by_source.values())
+        both_fingers_contact = bool(
+            np.all(finger_norms > self.contact_epsilon_n)
+        )
+        valid_step = bool(
+            grasp_started
+            and both_fingers_contact
+            and raw_squeeze > self.contact_epsilon_n
+        )
+        if valid_step:
+            self._force_sum += float(raw_squeeze)
+            self._valid_samples += 1
+
+        return {
+            "reward_grasp_observed": bool(grasp_observed),
+            "reward_grasp_terms_active": active_terms,
+            "reward_grasp_started": bool(grasp_started),
+            "reward_force_valid_step": bool(valid_step),
+            "reward_squeeze_meas_raw": float(raw_squeeze),
+        }
+
+    def summary(self) -> dict[str, Any]:
+        grasp_started = any(self._grasp_started_by_source.values())
+        if not grasp_started:
+            status = "grasp_not_started"
+        elif self._valid_samples == 0:
+            status = "no_valid_samples"
+        elif self._valid_samples < self.min_valid_samples:
+            status = "insufficient_samples"
+        else:
+            status = "complete"
+        mean_force = (
+            self._force_sum / float(self._valid_samples)
+            if self._valid_samples > 0
+            else None
+        )
+        return {
+            "trajectory_mean_measured_squeeze": mean_force,
+            "trajectory_force_valid_samples": int(self._valid_samples),
+            "trajectory_force_status": status,
+            "trajectory_force_error": None,
+            "grasp_started": bool(grasp_started),
+            "grasp_start_step": self._grasp_start_step,
+        }
+
 
 def resolve_episode_termination(
     *,
@@ -491,6 +643,70 @@ def aggregate_success_force_metrics(
     return aggregates, counts
 
 
+def _numeric_summary(values: Sequence[float]) -> dict[str, int | float | None]:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    return {
+        "count": len(finite),
+        "mean": _mean_or_none(finite),
+        "median": float(np.median(finite)) if finite else None,
+        "min": min(finite) if finite else None,
+        "max": max(finite) if finite else None,
+    }
+
+
+def summarize_trajectory_force_metrics(
+    episodes: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate only reward-eligible trajectory means while retaining coverage."""
+
+    eligible_all: list[float] = []
+    eligible_success: list[float] = []
+    valid_samples_all: list[float] = []
+    valid_samples_success: list[float] = []
+    successful_total = 0
+    successful_ineligible = 0
+
+    for episode in episodes:
+        success = episode.get("success") is True
+        successful_total += int(success)
+        sample_count = episode.get("trajectory_force_valid_samples")
+        if type(sample_count) is int and sample_count >= 0:
+            valid_samples_all.append(float(sample_count))
+            if success:
+                valid_samples_success.append(float(sample_count))
+
+        value = episode.get("trajectory_mean_measured_squeeze")
+        eligible = (
+            episode.get("trajectory_force_status") == "complete"
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+        if eligible:
+            eligible_all.append(float(value))
+            if success:
+                eligible_success.append(float(value))
+        elif success:
+            successful_ineligible += 1
+
+    return {
+        "success_trajectory_mean_measured_squeeze": _mean_or_none(
+            eligible_success
+        ),
+        "success_trajectory_force_episode_count": len(eligible_success),
+        "all_eligible_trajectory_mean_measured_squeeze": _mean_or_none(
+            eligible_all
+        ),
+        "all_eligible_trajectory_force_episode_count": len(eligible_all),
+        "successful_trajectory_force_total_episodes": successful_total,
+        "successful_trajectory_force_ineligible_episodes": successful_ineligible,
+        "trajectory_force_valid_sample_statistics": {
+            "all": _numeric_summary(valid_samples_all),
+            "successful": _numeric_summary(valid_samples_success),
+        },
+    }
+
+
 def _summarize_step_group(episodes: Sequence[dict[str, Any]]) -> dict[str, int | float | None]:
     summary: dict[str, int | float | None] = {"episodes": len(episodes)}
     for field in ("env_steps", "inference_chunks"):
@@ -579,12 +795,49 @@ def validate_episode_records(
                 continue
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                 warnings.append(f"{label} has invalid {key}={value!r}")
+        trajectory_status = episode.get("trajectory_force_status")
+        if trajectory_status not in TRAJECTORY_FORCE_STATUSES:
+            warnings.append(
+                f"{label} has invalid trajectory_force_status={trajectory_status!r}"
+            )
+        trajectory_samples = episode.get("trajectory_force_valid_samples")
+        if type(trajectory_samples) is not int or trajectory_samples < 0:
+            warnings.append(
+                f"{label} has invalid trajectory_force_valid_samples="
+                f"{trajectory_samples!r}"
+            )
+        trajectory_mean = episode.get("trajectory_mean_measured_squeeze")
+        if trajectory_mean is not None and (
+            isinstance(trajectory_mean, bool)
+            or not isinstance(trajectory_mean, (int, float))
+            or not math.isfinite(float(trajectory_mean))
+        ):
+            warnings.append(
+                f"{label} has invalid trajectory_mean_measured_squeeze="
+                f"{trajectory_mean!r}"
+            )
+        if trajectory_status == "complete" and trajectory_mean is None:
+            warnings.append(f"{label} complete trajectory force metric has no mean")
+        if type(episode.get("grasp_started")) is not bool:
+            warnings.append(
+                f"{label} has invalid grasp_started={episode.get('grasp_started')!r}"
+            )
+        grasp_start_step = episode.get("grasp_start_step")
+        if grasp_start_step is not None and (
+            type(grasp_start_step) is not int or grasp_start_step < 0
+        ):
+            warnings.append(
+                f"{label} has invalid grasp_start_step={grasp_start_step!r}"
+            )
     return warnings
 
 
 __all__ = [
     "FORCE_METRIC_KEYS",
+    "TRAJECTORY_FORCE_STATUSES",
+    "TrajectoryForceTracker",
     "aggregate_success_force_metrics",
+    "summarize_trajectory_force_metrics",
     "summarize_episode_force_metrics",
     "summarize_step_statistics",
     "validate_episode_records",

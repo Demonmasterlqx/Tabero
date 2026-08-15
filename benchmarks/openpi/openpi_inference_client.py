@@ -36,12 +36,14 @@ from benchmarks.common.closedloop_policy_inference import (
     ClosedLoopPolicyInference,
 )
 from benchmarks.common.episode_metrics import (
+    TrajectoryForceTracker,
     aggregate_success_force_metrics,
     extract_damage_threshold_snapshot,
     extract_friction_snapshot,
     extract_object_damage_details,
     resolve_episode_termination,
     summarize_episode_force_metrics,
+    summarize_trajectory_force_metrics,
 )
 from benchmarks.common.episode_lift import EpisodeLiftTracker
 from benchmarks.common.episode_video import EpisodeVideoWriter
@@ -336,6 +338,9 @@ class OpenpiClientArguments(ClosedLoopArguments):
     # A lift is a post-contact height increase held for consecutive env steps.
     lift_height_threshold_m: float = 0.03
     lift_hold_steps: int = 5
+    # Match RLinf success.force_bonus trajectory-force eligibility.
+    reward_force_contact_epsilon_n: float = 1.0
+    reward_force_min_valid_samples: int = 4
 
     # Control mode parameters
     # Supported modes:
@@ -574,6 +579,20 @@ def run_closed_loop_policy(  # noqa: C901
     success_term: Callable[[gym.Env], bool] | None,
 ):
     """Run the closed loop policy evaluation."""
+    if (
+        not np.isfinite(args.reward_force_contact_epsilon_n)
+        or args.reward_force_contact_epsilon_n < 0.0
+    ):
+        raise ValueError(
+            "--reward-force-contact-epsilon-n must be finite and non-negative"
+        )
+    if (
+        isinstance(args.reward_force_min_valid_samples, bool)
+        or args.reward_force_min_valid_samples < 1
+    ):
+        raise ValueError(
+            "--reward-force-min-valid-samples must be a positive integer"
+        )
     tactile_buf = _OnlineTactileBuffer(
         tactile_sensors=args.tactile_sensor_names,
         tactile_output_type=args.tactile_output_type,
@@ -785,6 +804,10 @@ def run_closed_loop_policy(  # noqa: C901
             # 缓存逐步左右指实测 3D 力，用于接触步数与覆盖率统计。
             exp_fL_meas_values: list[np.ndarray] = []
             exp_fR_meas_values: list[np.ndarray] = []
+
+            # RLinf success.force_bonus-equivalent trajectory force tracking.
+            trajectory_force_tracker: TrajectoryForceTracker | None = None
+            trajectory_force_error: str | None = None
 
             # JSON-configured target-contact squeeze override audit.
             exp_override_configured = False
@@ -1128,6 +1151,8 @@ def run_closed_loop_policy(  # noqa: C901
                     step_fR_pred = None
                     step_fL_meas = None
                     step_fR_meas = None
+                    step_fL_meas_raw = None
+                    step_fR_meas_raw = None
                     step_squeeze_pred = None
                     step_squeeze_meas = None
                     step_ap_pred = None
@@ -1139,6 +1164,13 @@ def run_closed_loop_policy(  # noqa: C901
                     step_effective_single_finger_target = None
                     step_effective_squeeze_target = None
                     step_target_contact_force_norm = None
+                    step_reward_force = {
+                        "reward_grasp_observed": None,
+                        "reward_grasp_terms_active": [],
+                        "reward_grasp_started": False,
+                        "reward_force_valid_step": False,
+                        "reward_squeeze_meas_raw": None,
+                    }
                     step_lift_state = {
                         "target_object_height_m": None,
                         "target_object_lift_delta_m": None,
@@ -1200,6 +1232,12 @@ def run_closed_loop_policy(  # noqa: C901
                             step_fR_pred = _vector3_or_none(debug.get("fR_pred_local")) or step_fR_pred
                             step_fL_meas = _vector3_or_none(debug.get("fL_meas_local"))
                             step_fR_meas = _vector3_or_none(debug.get("fR_meas_local"))
+                            step_fL_meas_raw = _vector3_or_none(
+                                debug.get("fL_meas_local_raw")
+                            ) or step_fL_meas
+                            step_fR_meas_raw = _vector3_or_none(
+                                debug.get("fR_meas_local_raw")
+                            ) or step_fR_meas
                             if step_fL_meas is not None and step_fR_meas is not None:
                                 exp_fL_meas_values.append(np.asarray(step_fL_meas, dtype=np.float32))
                                 exp_fR_meas_values.append(np.asarray(step_fR_meas, dtype=np.float32))
@@ -1316,6 +1354,8 @@ def run_closed_loop_policy(  # noqa: C901
                             step_ap_meas = ap_meas
                             step_fL_meas = _vector3_or_none(f_left)
                             step_fR_meas = _vector3_or_none(f_right)
+                            step_fL_meas_raw = step_fL_meas
+                            step_fR_meas_raw = step_fR_meas
 
                             # Keep raw 3D forces for strict per-episode metrics aggregation.
                             if step_fL_meas is not None and step_fR_meas is not None:
@@ -1332,6 +1372,85 @@ def run_closed_loop_policy(  # noqa: C901
                         except Exception:
                             # 可视化失败不应中断主流程
                             pass
+
+                    if trajectory_force_error is None:
+                        try:
+                            if (
+                                step_fL_meas_raw is None
+                                or step_fR_meas_raw is None
+                            ):
+                                policy_obs = obs.get("policy", {})
+                                gnf = policy_obs.get("gripper_net_force")
+                                if gnf is None:
+                                    raise RuntimeError(
+                                        "current raw gripper force is unavailable"
+                                    )
+                                if isinstance(gnf, torch.Tensor):
+                                    gnf = gnf.detach().cpu().numpy()
+                                force_history = np.asarray(gnf, dtype=np.float32)
+                                if (
+                                    force_history.ndim != 4
+                                    or force_history.shape[0] != 1
+                                    or force_history.shape[2:] != (2, 3)
+                                    or force_history.shape[1] < 1
+                                ):
+                                    raise RuntimeError(
+                                        "gripper_net_force must have shape "
+                                        f"(1, H>=1, 2, 3), got {force_history.shape}"
+                                    )
+                                force_lr_raw = force_history[0, -1]
+                                step_fL_meas_raw = _vector3_or_none(
+                                    force_lr_raw[0]
+                                )
+                                step_fR_meas_raw = _vector3_or_none(
+                                    force_lr_raw[1]
+                                )
+                            if (
+                                step_fL_meas_raw is None
+                                or step_fR_meas_raw is None
+                            ):
+                                raise RuntimeError(
+                                    "raw gripper force contains invalid values"
+                                )
+
+                            grasp_observations = (
+                                env.unwrapped.observation_manager.compute_group(
+                                    "subtask_terms", update_history=False
+                                )
+                            )
+                            if not isinstance(grasp_observations, dict):
+                                raise RuntimeError(
+                                    "subtask_terms observations are not a dictionary"
+                                )
+                            if trajectory_force_tracker is None:
+                                grasp_term_names = sorted(
+                                    name
+                                    for name in grasp_observations
+                                    if name.startswith("grasp_")
+                                )
+                                trajectory_force_tracker = TrajectoryForceTracker(
+                                    grasp_term_names,
+                                    contact_epsilon_n=(
+                                        args.reward_force_contact_epsilon_n
+                                    ),
+                                    min_valid_samples=(
+                                        args.reward_force_min_valid_samples
+                                    ),
+                                )
+                            step_reward_force = trajectory_force_tracker.update(
+                                step_index=total_steps_taken,
+                                grasp_observations=grasp_observations,
+                                force_lr_raw=np.asarray(
+                                    [step_fL_meas_raw, step_fR_meas_raw],
+                                    dtype=np.float32,
+                                ),
+                            )
+                        except Exception as exc:
+                            trajectory_force_error = str(exc)
+                            print(
+                                "[Trajectory-Force] Failed to update reward-aligned "
+                                f"metric for experiment {exp_idx}: {exc}"
+                            )
 
                     if lift_tracker is not None and lift_object is not None:
                         object_height_m = float(
@@ -1351,7 +1470,7 @@ def run_closed_loop_policy(  # noqa: C901
                     if args.step_trace_path is not None:
                         exp_step_trace_rows.append(
                             {
-                                "schema_version": 1,
+                                "schema_version": 2,
                                 "task_suite": args.task_suite,
                                 "task_id": int(args.task_id),
                                 "experiment_index": int(exp_idx),
@@ -1376,6 +1495,7 @@ def run_closed_loop_policy(  # noqa: C901
                                 "target_contact_force_norm": step_target_contact_force_norm,
                                 "effective_single_finger_target_n": step_effective_single_finger_target,
                                 "effective_squeeze_target_n": step_effective_squeeze_target,
+                                **step_reward_force,
                                 **step_lift_state,
                             }
                         )
@@ -1640,6 +1760,22 @@ def run_closed_loop_policy(  # noqa: C901
                 fL_meas_values=exp_fL_meas_values,
                 fR_meas_values=exp_fR_meas_values,
             )
+            if trajectory_force_tracker is not None:
+                trajectory_force_summary = trajectory_force_tracker.summary()
+            else:
+                trajectory_force_summary = {
+                    "trajectory_mean_measured_squeeze": None,
+                    "trajectory_force_valid_samples": 0,
+                    "trajectory_force_status": "unavailable",
+                    "trajectory_force_error": None,
+                    "grasp_started": False,
+                    "grasp_start_step": None,
+                }
+            if trajectory_force_error is not None:
+                trajectory_force_summary["trajectory_force_status"] = "error"
+                trajectory_force_summary["trajectory_force_error"] = (
+                    trajectory_force_error
+                )
 
             def _mean_or_none(values: list[float]) -> float | None:
                 return float(np.mean(values)) if values else None
@@ -1737,6 +1873,7 @@ def run_closed_loop_policy(  # noqa: C901
                 "env_steps": int(total_steps_taken),
                 "inference_chunks": int(inference_chunks_taken),
                 **force_summary,
+                **trajectory_force_summary,
                 "force_override": force_override_summary,
                 "lift": lift_summary,
                 "video": video_summary,
@@ -1797,6 +1934,21 @@ def run_closed_loop_policy(  # noqa: C901
     print(f"Success rate: {success_rate:.2f}%")
 
     force_aggregates, force_metric_counts = aggregate_success_force_metrics(episode_metrics_records)
+    trajectory_force_aggregates = summarize_trajectory_force_metrics(
+        episode_metrics_records
+    )
+    success_trajectory_force = trajectory_force_aggregates[
+        "success_trajectory_mean_measured_squeeze"
+    ]
+    success_trajectory_force_count = trajectory_force_aggregates[
+        "success_trajectory_force_episode_count"
+    ]
+    if success_trajectory_force is not None:
+        print(
+            "[Trajectory-Force] Task reward_aligned "
+            f"success_trajectory_mean_measured_squeeze={success_trajectory_force:.4f} "
+            f"over {success_trajectory_force_count} eligible successes"
+        )
     task_avg_pred = force_aggregates["squeeze_avg_pred"]
     task_avg_meas = force_aggregates["squeeze_avg_meas"]
     if task_avg_pred is not None and task_avg_meas is not None:

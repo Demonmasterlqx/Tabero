@@ -43,6 +43,12 @@ def _episode_record(index: int, *, success: bool, env_steps: int, chunks: int) -
         "ap_avg_meas": 6.0,
         "ap_max_pred": 7.0,
         "ap_max_meas": 8.0,
+        "trajectory_mean_measured_squeeze": 2.0,
+        "trajectory_force_valid_samples": 4,
+        "trajectory_force_status": "complete",
+        "trajectory_force_error": None,
+        "grasp_started": True,
+        "grasp_start_step": 1,
         "trace_status": "disabled",
         "trace_rows": 0,
         "trace_error": None,
@@ -97,6 +103,12 @@ def test_openpi_command_passes_lift_detection_contract():
     assert command[command.index("--lift_height_threshold_m") + 1] == "0.03"
     assert "--lift_hold_steps" in command
     assert command[command.index("--lift_hold_steps") + 1] == "5"
+    assert command[
+        command.index("--reward_force_contact_epsilon_n") + 1
+    ] == "1.0"
+    assert command[
+        command.index("--reward_force_min_valid_samples") + 1
+    ] == "4"
 
 
 def test_openpi_osc_actions_are_sent_as_7d_actions():
@@ -423,12 +435,12 @@ def test_step_trace_cli_resolution_command_and_validation(tmp_path):
     command = rte.build_command(config, "libero_object", 1, step_trace_path=trace_path)
     assert command[command.index("--step_trace_path") + 1] == str(trace_path)
 
-    episode = _episode_record(0, success=True, env_steps=2, chunks=1)
+    episode = _episode_record(0, success=True, env_steps=4, chunks=1)
     episode["trace_status"] = "complete"
-    episode["trace_rows"] = 2
+    episode["trace_rows"] = 4
     trace_path.parent.mkdir(parents=True)
     rows = []
-    for step in range(2):
+    for step in range(4):
         rows.append(
             {
                 "experiment_index": 0,
@@ -452,6 +464,11 @@ def test_step_trace_cli_resolution_command_and_validation(tmp_path):
                 "target_contact_force_norm": float(step),
                 "effective_single_finger_target_n": 13.0 if step else 2.0,
                 "effective_squeeze_target_n": 26.0 if step else 4.0,
+                "reward_grasp_observed": step == 0,
+                "reward_grasp_terms_active": ["grasp_1"] if step == 0 else [],
+                "reward_grasp_started": True,
+                "reward_force_valid_step": True,
+                "reward_squeeze_meas_raw": 2.0,
             }
         )
     trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -467,7 +484,7 @@ def test_step_trace_cli_resolution_command_and_validation(tmp_path):
     assert descriptor == {
         "enabled": True,
         "path": "step_traces_openpi_tactile_20260801_010203/libero_object_task1.jsonl",
-        "rows": 2,
+        "rows": 4,
         "status": "complete",
     }
     _, artifacts, _ = rte.collect_episode_metric_artifacts(
@@ -525,6 +542,7 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
         "metrics_warnings": [],
         "step_statistics": rte.summarize_step_statistics([episode]),
         "force_metric_episode_counts": dict.fromkeys(rte.FORCE_METRIC_KEYS, 0),
+        **rte.summarize_trajectory_force_metrics([episode]),
         "damage_threshold_statistics": rte.summarize_damage_threshold_statistics(
             [episode]
         ),
@@ -539,7 +557,9 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
     rte.save_success_rates_txt([result], txt_path, config)
 
     json_result = json.loads(json_path.read_text())
-    assert json_result["metadata"]["episode_metrics_schema_version"] == 3
+    assert json_result["metadata"]["episode_metrics_schema_version"] == 4
+    assert json_result["metadata"]["reward_force_contact_epsilon_n"] == 1.0
+    assert json_result["metadata"]["reward_force_min_valid_samples"] == 4
     task = json_result["results"]["libero_object_task1"]
     text = txt_path.read_text()
     assert task["metrics_status"] == "complete"
@@ -558,4 +578,8 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
     assert "cream_cheese_1 | mass_friction | 0.2000" in text
     assert "cream_cheese_1 | 0.5000 | 0.5000" in text
     assert "Per-experiment force metrics:" in text
+    assert "Reward-aligned trajectory force:" in text
+    assert "Per-experiment reward-aligned trajectory force:" in text
+    assert task["success_trajectory_force_episode_count"] == 0
+    assert task["all_eligible_trajectory_mean_measured_squeeze"] == 2.0
     assert "N/A" in text

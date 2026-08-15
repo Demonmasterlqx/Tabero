@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.common.episode_metrics import (
     FORCE_METRIC_KEYS,
+    TrajectoryForceTracker,
     aggregate_success_force_metrics,
     extract_damage_threshold_snapshot,
     extract_friction_snapshot,
@@ -20,8 +21,147 @@ from benchmarks.common.episode_metrics import (
     summarize_damage_threshold_statistics,
     summarize_friction_statistics,
     summarize_step_statistics,
+    summarize_trajectory_force_metrics,
     validate_episode_records,
 )
+
+
+def _raw_lr(squeeze: float, *, left_norm_scale: float = 1.0) -> np.ndarray:
+    force = np.zeros((2, 3), dtype=np.float32)
+    force[0, 2] = 0.5 * squeeze * left_norm_scale
+    force[1, 2] = -0.5 * squeeze
+    return force
+
+
+def test_trajectory_force_tracker_matches_reward_grasp_and_contact_gates():
+    tracker = TrajectoryForceTracker(
+        ("grasp_1",), contact_epsilon_n=1.0, min_valid_samples=4
+    )
+
+    pre_grasp = tracker.update(
+        step_index=0,
+        grasp_observations={"grasp_1": False},
+        force_lr_raw=_raw_lr(100.0),
+    )
+    assert pre_grasp["reward_force_valid_step"] is False
+
+    expected_squeezes = [20.0, 40.0, 60.0, 80.0]
+    for step, squeeze in enumerate(expected_squeezes, start=1):
+        trace = tracker.update(
+            step_index=step,
+            grasp_observations={"grasp_1": step == 1},
+            force_lr_raw=_raw_lr(squeeze),
+        )
+        assert trace["reward_grasp_started"] is True
+        assert trace["reward_force_valid_step"] is True
+
+    # The grasp observation is latched, but a released/zero-force step is ignored.
+    released = tracker.update(
+        step_index=5,
+        grasp_observations={"grasp_1": False},
+        force_lr_raw=np.zeros((2, 3), dtype=np.float32),
+    )
+    assert released["reward_grasp_started"] is True
+    assert released["reward_force_valid_step"] is False
+    assert tracker.summary() == {
+        "trajectory_mean_measured_squeeze": pytest.approx(50.0),
+        "trajectory_force_valid_samples": 4,
+        "trajectory_force_status": "complete",
+        "trajectory_force_error": None,
+        "grasp_started": True,
+        "grasp_start_step": 1,
+    }
+
+
+def test_trajectory_force_tracker_rejects_single_finger_and_uses_raw_not_ema():
+    tracker = TrajectoryForceTracker(
+        ("grasp_1",), contact_epsilon_n=1.0, min_valid_samples=1
+    )
+    single_finger = np.asarray([[0.0, 0.0, 0.5], [0.0, 0.0, -30.0]])
+    trace = tracker.update(
+        step_index=0,
+        grasp_observations={"grasp_1": True},
+        force_lr_raw=single_finger,
+    )
+    assert trace["reward_force_valid_step"] is False
+
+    # A hypothetical EMA value is deliberately absent: only raw vectors enter.
+    raw_trace = tracker.update(
+        step_index=1,
+        grasp_observations={"grasp_1": False},
+        force_lr_raw=_raw_lr(30.0),
+    )
+    assert raw_trace["reward_squeeze_meas_raw"] == pytest.approx(30.0)
+    assert tracker.summary()["trajectory_mean_measured_squeeze"] == pytest.approx(
+        30.0
+    )
+
+
+def test_trajectory_force_tracker_status_multi_source_and_reset():
+    tracker = TrajectoryForceTracker(
+        ("grasp_1", "grasp_2"),
+        contact_epsilon_n=1.0,
+        min_valid_samples=4,
+    )
+    for step in range(3):
+        trace = tracker.update(
+            step_index=step,
+            grasp_observations={
+                "grasp_1": step == 0,
+                "grasp_2": step == 0,
+            },
+            force_lr_raw=_raw_lr(10.0 + step),
+        )
+        if step == 0:
+            assert trace["reward_grasp_terms_active"] == ["grasp_1", "grasp_2"]
+    assert tracker.summary()["trajectory_force_status"] == "insufficient_samples"
+    assert tracker.summary()["trajectory_force_valid_samples"] == 3
+
+    tracker.reset()
+    assert tracker.summary()["trajectory_force_status"] == "grasp_not_started"
+    assert tracker.summary()["trajectory_mean_measured_squeeze"] is None
+
+    tracker.update(
+        step_index=0,
+        grasp_observations={"grasp_1": True, "grasp_2": False},
+        force_lr_raw=np.zeros((2, 3), dtype=np.float32),
+    )
+    assert tracker.summary()["trajectory_force_status"] == "no_valid_samples"
+    assert tracker.summary()["trajectory_force_valid_samples"] == 0
+    assert tracker.summary()["trajectory_mean_measured_squeeze"] is None
+
+
+def test_trajectory_force_aggregation_is_success_and_eligibility_aware():
+    episodes = [
+        {
+            "success": True,
+            "trajectory_force_status": "complete",
+            "trajectory_force_valid_samples": 4,
+            "trajectory_mean_measured_squeeze": 20.0,
+        },
+        {
+            "success": True,
+            "trajectory_force_status": "insufficient_samples",
+            "trajectory_force_valid_samples": 3,
+            "trajectory_mean_measured_squeeze": 10.0,
+        },
+        {
+            "success": False,
+            "trajectory_force_status": "complete",
+            "trajectory_force_valid_samples": 5,
+            "trajectory_mean_measured_squeeze": 40.0,
+        },
+    ]
+
+    summary = summarize_trajectory_force_metrics(episodes)
+    assert summary["success_trajectory_mean_measured_squeeze"] == 20.0
+    assert summary["success_trajectory_force_episode_count"] == 1
+    assert summary["all_eligible_trajectory_mean_measured_squeeze"] == 30.0
+    assert summary["all_eligible_trajectory_force_episode_count"] == 2
+    assert summary["successful_trajectory_force_ineligible_episodes"] == 1
+    assert summary["trajectory_force_valid_sample_statistics"]["successful"][
+        "median"
+    ] == pytest.approx(3.5)
 
 
 def test_extract_friction_snapshot_is_json_safe():

@@ -31,6 +31,7 @@ from benchmarks.common.episode_metrics import (
     summarize_damage_threshold_statistics,
     summarize_friction_statistics,
     summarize_step_statistics,
+    summarize_trajectory_force_metrics,
     validate_episode_records,
 )
 
@@ -125,6 +126,8 @@ class EvaluationConfig:
     replan_steps: int = 10
     lift_height_threshold_m: float = 0.03
     lift_hold_steps: int = 5
+    reward_force_contact_epsilon_n: float = 1.0
+    reward_force_min_valid_samples: int = 4
 
     camera_names: tuple[str, ...] = ("agentview_cam", "eye_in_hand_cam")
     target_image_size: tuple[int, int, int] = (224, 224, 3)
@@ -212,6 +215,12 @@ def build_command(
         "--seed", str(config.seed),
         "--lift_height_threshold_m", str(config.lift_height_threshold_m),
         "--lift_hold_steps", str(config.lift_hold_steps),
+        "--reward_force_contact_epsilon_n", str(
+            config.reward_force_contact_epsilon_n
+        ),
+        "--reward_force_min_valid_samples", str(
+            config.reward_force_min_valid_samples
+        ),
     ]
 
     if config.policy_model == "openpi":
@@ -391,6 +400,7 @@ def validate_step_trace(
         return descriptor, warnings
 
     rows_by_episode: dict[int, set[int]] = {}
+    reward_values_by_episode: dict[int, list[float]] = {}
     episode_by_index = {
         episode["experiment_index"]: episode
         for episode in episodes
@@ -418,6 +428,11 @@ def validate_step_trace(
         "target_contact_force_norm",
         "effective_single_finger_target_n",
         "effective_squeeze_target_n",
+        "reward_grasp_observed",
+        "reward_grasp_terms_active",
+        "reward_grasp_started",
+        "reward_force_valid_step",
+        "reward_squeeze_meas_raw",
     }
     try:
         with open(path, encoding="utf-8") as trace_file:
@@ -437,6 +452,20 @@ def validate_step_trace(
                 if missing_fields:
                     warnings.append(
                         f"step trace line {line_number} is missing fields: {', '.join(missing_fields)}"
+                    )
+                for bool_field in (
+                    "reward_grasp_observed",
+                    "reward_grasp_started",
+                    "reward_force_valid_step",
+                ):
+                    if type(row.get(bool_field)) is not bool:
+                        warnings.append(
+                            f"step trace line {line_number} has invalid {bool_field}"
+                        )
+                if not isinstance(row.get("reward_grasp_terms_active"), list):
+                    warnings.append(
+                        f"step trace line {line_number} has invalid "
+                        "reward_grasp_terms_active"
                     )
                 experiment_index = row.get("experiment_index")
                 env_step_index = row.get("env_step_index")
@@ -473,6 +502,21 @@ def validate_step_trace(
                         f"step trace has duplicate env_step_index={env_step_index} for episode {experiment_index}"
                     )
                 step_indices.add(env_step_index)
+                if row.get("reward_force_valid_step") is True:
+                    reward_squeeze = row.get("reward_squeeze_meas_raw")
+                    if (
+                        isinstance(reward_squeeze, bool)
+                        or not isinstance(reward_squeeze, (int, float))
+                        or not math.isfinite(float(reward_squeeze))
+                    ):
+                        warnings.append(
+                            f"step trace line {line_number} has invalid "
+                            "reward_squeeze_meas_raw for a valid reward-force step"
+                        )
+                    else:
+                        reward_values_by_episode.setdefault(
+                            experiment_index, []
+                        ).append(float(reward_squeeze))
     except OSError as exc:
         warnings.append(f"failed to read step trace: {exc}")
         return descriptor, warnings
@@ -488,6 +532,28 @@ def validate_step_trace(
         if actual_indices != set(range(env_steps)):
             warnings.append(
                 f"step trace episode {experiment_index} does not cover env_step_index 0..{env_steps - 1}"
+            )
+        reward_values = reward_values_by_episode.get(experiment_index, [])
+        if episode.get("trajectory_force_valid_samples") != len(reward_values):
+            warnings.append(
+                f"step trace episode {experiment_index} reward-force samples="
+                f"{len(reward_values)} do not match episode metric="
+                f"{episode.get('trajectory_force_valid_samples')!r}"
+            )
+        episode_mean = episode.get("trajectory_mean_measured_squeeze")
+        trace_mean = sum(reward_values) / len(reward_values) if reward_values else None
+        if episode_mean is None:
+            if trace_mean is not None:
+                warnings.append(
+                    f"step trace episode {experiment_index} has reward-force mean "
+                    f"{trace_mean} while episode metric is None"
+                )
+        elif trace_mean is None or not math.isclose(
+            float(episode_mean), trace_mean, rel_tol=1.0e-7, abs_tol=1.0e-7
+        ):
+            warnings.append(
+                f"step trace episode {experiment_index} reward-force mean="
+                f"{trace_mean!r} does not match episode metric={episode_mean!r}"
             )
     if descriptor["rows"] != expected_total:
         warnings.append(f"step trace rows={descriptor['rows']} do not match total env_steps={expected_total}")
@@ -531,6 +597,29 @@ def collect_episode_metric_artifacts(
             metrics_warnings.append(
                 f"episode success count={recorded_successes} does not match task summary={successful_experiments}"
             )
+
+    if config.policy_model == "openpi" and config.control_mode in {
+        "hybrid",
+        "tactile",
+        "binary",
+    }:
+        for episode in episodes:
+            if (
+                episode.get("success") is True
+                and (
+                    episode.get("trajectory_force_status") != "complete"
+                    or type(episode.get("trajectory_force_valid_samples"))
+                    is not int
+                    or episode.get("trajectory_force_valid_samples", 0)
+                    < config.reward_force_min_valid_samples
+                )
+            ):
+                metrics_warnings.append(
+                    "successful episode "
+                    f"{episode.get('experiment_index')} has trajectory_force_status="
+                    f"{episode.get('trajectory_force_status')!r}, valid_samples="
+                    f"{episode.get('trajectory_force_valid_samples')!r}"
+                )
 
     if config.record_step_traces:
         for episode in episodes:
@@ -579,11 +668,13 @@ def collect_episode_metric_artifacts(
     )
     metrics_warnings.extend(trace_warnings)
     force_aggregates, force_metric_episode_counts = aggregate_success_force_metrics(episodes)
+    trajectory_force_aggregates = summarize_trajectory_force_metrics(episodes)
     artifacts = {
         "metrics_status": "complete" if not metrics_warnings else "partial",
         "metrics_warnings": metrics_warnings,
         "step_statistics": summarize_step_statistics(episodes),
         "force_metric_episode_counts": force_metric_episode_counts,
+        **trajectory_force_aggregates,
         "damage_threshold_statistics": summarize_damage_threshold_statistics(episodes),
         "friction_statistics": summarize_friction_statistics(episodes),
         "episodes": episodes,
@@ -867,10 +958,16 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "task_environment": config.task if config.task else "auto",
             "num_total_experiments": config.num_total_experiments,
             "num_success_steps": config.num_success_steps,
-            "episode_metrics_schema_version": 3,
+            "episode_metrics_schema_version": 4,
             "replan_steps": config.replan_steps,
             "lift_height_threshold_m": config.lift_height_threshold_m,
             "lift_hold_steps": config.lift_hold_steps,
+            "reward_force_contact_epsilon_n": (
+                config.reward_force_contact_epsilon_n
+            ),
+            "reward_force_min_valid_samples": (
+                config.reward_force_min_valid_samples
+            ),
             "record_step_traces": config.record_step_traces,
             "step_trace_dir": str(config.step_trace_dir) if config.step_trace_dir is not None else None,
             "record_videos": config.record_videos,
@@ -932,6 +1029,27 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "force_metric_episode_counts": result.get(
                 "force_metric_episode_counts", dict.fromkeys(FORCE_METRIC_KEYS, 0)
             ),
+            "success_trajectory_mean_measured_squeeze": result.get(
+                "success_trajectory_mean_measured_squeeze"
+            ),
+            "success_trajectory_force_episode_count": result.get(
+                "success_trajectory_force_episode_count", 0
+            ),
+            "all_eligible_trajectory_mean_measured_squeeze": result.get(
+                "all_eligible_trajectory_mean_measured_squeeze"
+            ),
+            "all_eligible_trajectory_force_episode_count": result.get(
+                "all_eligible_trajectory_force_episode_count", 0
+            ),
+            "successful_trajectory_force_total_episodes": result.get(
+                "successful_trajectory_force_total_episodes", 0
+            ),
+            "successful_trajectory_force_ineligible_episodes": result.get(
+                "successful_trajectory_force_ineligible_episodes", 0
+            ),
+            "trajectory_force_valid_sample_statistics": result.get(
+                "trajectory_force_valid_sample_statistics", {}
+            ),
             "damage_threshold_statistics": result.get(
                 "damage_threshold_statistics", {}
             ),
@@ -967,6 +1085,47 @@ def _write_episode_metrics_txt(output, result: dict) -> None:
         output.write("    Metrics warnings:\n")
         for warning in metrics_warnings:
             output.write(f"      - {warning}\n")
+
+    output.write("    Reward-aligned trajectory force:\n")
+    output.write(
+        "      success_trajectory_mean_measured_squeeze="
+        f"{_txt_value(result.get('success_trajectory_mean_measured_squeeze'))} "
+        "eligible_successes="
+        f"{_txt_value(result.get('success_trajectory_force_episode_count', 0))} "
+        "successful_total="
+        f"{_txt_value(result.get('successful_trajectory_force_total_episodes', 0))} "
+        "successful_ineligible="
+        f"{_txt_value(result.get('successful_trajectory_force_ineligible_episodes', 0))}\n"
+    )
+    output.write(
+        "      all_eligible_trajectory_mean_measured_squeeze="
+        f"{_txt_value(result.get('all_eligible_trajectory_mean_measured_squeeze'))} "
+        "eligible_episodes="
+        f"{_txt_value(result.get('all_eligible_trajectory_force_episode_count', 0))}\n"
+    )
+    output.write(
+        "      group | count | valid_samples_mean | valid_samples_median | "
+        "valid_samples_min | valid_samples_max\n"
+    )
+    trajectory_sample_stats = result.get(
+        "trajectory_force_valid_sample_statistics", {}
+    )
+    for group in ("all", "successful"):
+        stats = trajectory_sample_stats.get(group, {})
+        output.write(
+            "      "
+            + " | ".join(
+                [
+                    group,
+                    _txt_value(stats.get("count")),
+                    _txt_value(stats.get("mean")),
+                    _txt_value(stats.get("median")),
+                    _txt_value(stats.get("min")),
+                    _txt_value(stats.get("max")),
+                ]
+            )
+            + "\n"
+        )
 
     output.write("    Step statistics:\n")
     output.write(
@@ -1183,6 +1342,32 @@ def _write_episode_metrics_txt(output, result: dict) -> None:
             + "\n"
         )
 
+    output.write("    Per-experiment reward-aligned trajectory force:\n")
+    output.write(
+        "      exp | status | grasp_started | grasp_start_step | valid_samples | "
+        "trajectory_mean_measured_squeeze | error\n"
+    )
+    if not episodes:
+        output.write("      N/A\n")
+    for episode in episodes:
+        output.write(
+            "      "
+            + " | ".join(
+                [
+                    _txt_value(episode.get("experiment_index")),
+                    _txt_value(episode.get("trajectory_force_status")),
+                    _txt_value(episode.get("grasp_started")),
+                    _txt_value(episode.get("grasp_start_step")),
+                    _txt_value(episode.get("trajectory_force_valid_samples")),
+                    _txt_value(
+                        episode.get("trajectory_mean_measured_squeeze")
+                    ),
+                    _txt_value(episode.get("trajectory_force_error")),
+                ]
+            )
+            + "\n"
+        )
+
 
 def save_success_rates_txt(results: list[dict], output_file: Path, config: EvaluationConfig):  # noqa: C901
     """Save success rates to a TXT file."""
@@ -1203,6 +1388,14 @@ def save_success_rates_txt(results: list[dict], output_file: Path, config: Evalu
             f.write(f"  abs7d: {config.abs7d}\n")
         f.write(f"  Experiments per task: {config.num_total_experiments}\n")
         f.write(f"  Success steps required: {config.num_success_steps}\n")
+        f.write(
+            "  Reward-force contact epsilon (N): "
+            f"{config.reward_force_contact_epsilon_n}\n"
+        )
+        f.write(
+            "  Reward-force minimum valid samples: "
+            f"{config.reward_force_min_valid_samples}\n"
+        )
         f.write(f"  Default max inference steps: {config.max_inference_steps}\n")
         f.write(f"  Replan steps: {config.replan_steps}\n")
         f.write(f"  Record step traces: {config.record_step_traces}\n")
@@ -1514,6 +1707,9 @@ def print_metrics_ascii_table(results: list[dict]):
         task_ap_mean_meas_mean = result.get("task_ap_mean_meas_mean")
         task_ap_max_mean = result.get("task_app_max_mean")
         task_ap_max_meas_mean = result.get("task_ap_max_meas_mean")
+        reward_aligned_squeeze = result.get(
+            "success_trajectory_mean_measured_squeeze"
+        )
 
         # 任务标签：如 libero_goal -> goal 0
         if isinstance(task_suite, str) and task_suite.startswith("libero_"):
@@ -1545,6 +1741,7 @@ def print_metrics_ascii_table(results: list[dict]):
                 _fmt(task_ap_mean_meas_mean, 4),
                 _fmt(task_ap_max_mean, 4),
                 _fmt(task_ap_max_meas_mean, 4),
+                _fmt(reward_aligned_squeeze, 4),
             ]
         )
 
@@ -1562,6 +1759,7 @@ def print_metrics_ascii_table(results: list[dict]):
         "ap_avg_meas",
         "ap_max_pred",
         "ap_max_meas",
+        "trajectory_mean_measured_squeeze",
     ]
 
     # 计算每一列宽度
@@ -1610,6 +1808,7 @@ def print_live_force_table_header():
         "ApMeas",
         "ApMaxPred",
         "ApMaxMeas",
+        "TrajSqMeas",
     ]
     line = " | ".join(h.center(12) for h in header)
     print("\n" + "=" * len(line))
@@ -1650,6 +1849,9 @@ def print_live_force_table_row(result: dict):
     task_ap_mean_meas_mean = result.get("task_ap_mean_meas_mean")
     task_ap_max_mean = result.get("task_app_max_mean")
     task_ap_max_meas_mean = result.get("task_ap_max_meas_mean")
+    reward_aligned_squeeze = result.get(
+        "success_trajectory_mean_measured_squeeze"
+    )
 
     cols = [
         task_label.ljust(12),
@@ -1662,6 +1864,7 @@ def print_live_force_table_row(result: dict):
         _fmt_float(task_ap_mean_meas_mean, precision=4),
         _fmt_float(task_ap_max_mean, precision=4),
         _fmt_float(task_ap_max_meas_mean, precision=4),
+        _fmt_float(reward_aligned_squeeze, precision=4),
     ]
 
     print(" | ".join(cols))
@@ -1695,6 +1898,20 @@ def main():
         raise ValueError("--lift-height-threshold-m must be finite and positive")
     if isinstance(config.lift_hold_steps, bool) or config.lift_hold_steps <= 0:
         raise ValueError("--lift-hold-steps must be a positive integer")
+    if (
+        not math.isfinite(config.reward_force_contact_epsilon_n)
+        or config.reward_force_contact_epsilon_n < 0.0
+    ):
+        raise ValueError(
+            "--reward-force-contact-epsilon-n must be finite and non-negative"
+        )
+    if (
+        isinstance(config.reward_force_min_valid_samples, bool)
+        or config.reward_force_min_valid_samples < 1
+    ):
+        raise ValueError(
+            "--reward-force-min-valid-samples must be a positive integer"
+        )
 
     workspace_root = Path(__file__).parent.parent.parent.resolve()
     config.output_dir.mkdir(parents=True, exist_ok=True)
