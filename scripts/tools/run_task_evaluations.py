@@ -6,6 +6,7 @@
 """Script to run policy inference evaluation on Libero task suites and record success rates."""
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -100,7 +101,7 @@ def _should_auto_use_tabero_tasks(hdf5_folder: Optional[Path], replayed_demos_di
 @dataclass
 class EvaluationConfig:
     """Configuration for running task evaluations."""
-    
+
     policy_model: str = "openpi"
     control_mode: str = "diffik"
     # OpenPI tactile 消融：透传到 openpi client 的 `--abs7d`
@@ -114,32 +115,36 @@ class EvaluationConfig:
     #   * tactile -> Isaac-Libero-Franka-Hybrid-Tactile-v0           (13D 力–位混合控制 + 触觉)
     # - 如需自定义环境，可通过 CLI 显式传入 `--task xxx`。
     task: str = ""
-    
+
     server_host: str = "127.0.1.1"
     server_port: int = 8000
-    
+
     num_total_experiments: int = 50
     num_success_steps: int = 8
     max_inference_steps: int = 80
     replan_steps: int = 10
-    
+    lift_height_threshold_m: float = 0.03
+    lift_hold_steps: int = 5
+
     camera_names: tuple[str, ...] = ("agentview_cam", "eye_in_hand_cam")
     target_image_size: tuple[int, int, int] = (224, 224, 3)
     send_dsrl_raw_image: bool = False
     num_steps_wait: int = 5
-    
+
     task_suites: tuple[str, ...] = ()
     task_ids: tuple[int, ...] = ()
-    
+
     hdf5_folder: Optional[Path] = None
     config_path: Optional[Path] = None
-    
+
     output_dir: Path = Path("./evaluation_results")
     output_format: str = "both"
     # Per-episode summaries are always recorded. Full per-env-step force traces are opt-in.
     record_step_traces: bool = False
     step_trace_dir: Optional[Path] = None
-    
+    record_videos: bool = False
+    record_camera_output_path: Optional[Path] = None
+
     headless: bool = True
     visualize: bool = False
     # Passed through to the IsaacLab AppLauncher in the OpenPI client.
@@ -155,7 +160,7 @@ class EvaluationConfig:
     # If empty, OpenPI client uses its own default.
     debug_path: str = ""
     seed: int = 11
-    
+
     openpi_script: str = "benchmarks/openpi/openpi_inference_client.py"
     gr00t_script: str = "benchmarks/gr00t/gr00t_inference_client.py"
 
@@ -194,7 +199,7 @@ def build_command(
     """Build command line arguments for subprocess."""
     python_script = config.openpi_script if config.policy_model == "openpi" else config.gr00t_script
     max_inference_steps = effective_max_inference_steps(config, task_suite)
-    
+
     cmd = [
         sys.executable, python_script,
         "--server_host", config.server_host,
@@ -205,6 +210,8 @@ def build_command(
         "--task_suite", task_suite,
         "--task_id", str(task_id),
         "--seed", str(config.seed),
+        "--lift_height_threshold_m", str(config.lift_height_threshold_m),
+        "--lift_hold_steps", str(config.lift_hold_steps),
     ]
 
     if config.policy_model == "openpi":
@@ -235,6 +242,12 @@ def build_command(
             cmd.append("--randomize_light")
         if step_trace_path is not None:
             cmd.extend(["--step_trace_path", str(step_trace_path)])
+        if config.record_videos:
+            video_dir = config.record_camera_output_path or (
+                config.output_dir / "videos" / f"{task_suite}_task{task_id}"
+            )
+            cmd.append("--record_videos")
+            cmd.extend(["--record_camera_output_path", str(video_dir)])
 
     if config.headless and not config.visualize:
         cmd.append("--headless")
@@ -246,12 +259,12 @@ def build_command(
         # Use equals form because Kit args commonly start with "--" and tyro would otherwise
         # parse the value as a new option in the child OpenPI client.
         cmd.append(f"--sim_kit_args={config.sim_kit_args}")
-    
+
     if config.debug_mode > 0:
         cmd.extend(["--debug_mode", str(config.debug_mode)])
         if config.debug_path:
             cmd.extend(["--debug_path", str(config.debug_path)])
-    
+
     if config.hdf5_folder:
         cmd.extend(["--hdf5_folder", str(config.hdf5_folder)])
 
@@ -398,6 +411,13 @@ def validate_step_trace(
         "ap_meas",
         "predicted_contact",
         "measured_contact",
+        "target_contact_override_enabled",
+        "target_contact_detected",
+        "target_contact_override_latched",
+        "target_contact_activation_step",
+        "target_contact_force_norm",
+        "effective_single_finger_target_n",
+        "effective_squeeze_target_n",
     }
     try:
         with open(path, encoding="utf-8") as trace_file:
@@ -525,6 +545,31 @@ def collect_episode_metric_artifacts(
                     f"does not match env_steps={episode.get('env_steps')!r}"
                 )
 
+    if config.record_videos:
+        for episode in episodes:
+            experiment_index = episode.get("experiment_index")
+            video = episode.get("video")
+            if not isinstance(video, dict):
+                metrics_warnings.append(
+                    f"episode {experiment_index} is missing its video descriptor"
+                )
+                continue
+            if video.get("status") != "complete":
+                metrics_warnings.append(
+                    f"episode {experiment_index} video_status={video.get('status')!r}: "
+                    f"{video.get('error')!r}"
+                )
+            if video.get("frames") != episode.get("env_steps"):
+                metrics_warnings.append(
+                    f"episode {experiment_index} video frames={video.get('frames')!r} "
+                    f"do not match env_steps={episode.get('env_steps')!r}"
+                )
+            video_path = video.get("path")
+            if not isinstance(video_path, str) or not Path(video_path).is_file():
+                metrics_warnings.append(
+                    f"episode {experiment_index} video file is missing: {video_path!r}"
+                )
+
     step_trace, trace_warnings = validate_step_trace(
         step_trace_path,
         episodes,
@@ -580,7 +625,7 @@ def run_single_evaluation(
 
     max_inference_steps = effective_max_inference_steps(config, task_suite)
     cmd = build_command(config, task_suite, task_id, step_trace_path=step_trace_path)
-    
+
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     if config.config_path:
@@ -603,7 +648,7 @@ def run_single_evaluation(
             cwd=workspace_root,
             env=env,
         )
-        
+
         for line in iter(process.stdout.readline, ''):
             if line:
                 output_lines.append(line)
@@ -628,7 +673,7 @@ def run_single_evaluation(
                 ):
                     continue
                 print(line, end='')
-        
+
         process.wait(timeout=3600)
         end_time = time.time()
 
@@ -685,7 +730,7 @@ def run_single_evaluation(
         task_app_max_mean = legacy_force_values["ap_max_pred"]
         task_ap_max_meas_mean = legacy_force_values["ap_max_meas"]
         metric_artifacts["metrics_status"] = "complete" if not metrics_warnings else "partial"
-        
+
         # Some subprocesses may print the final evaluation stats successfully but still exit with
         # a non-zero return code (e.g., teardown issues when closing IsaacSim). For reporting,
         # treat the task as "completed" if we could reliably parse success stats for the full
@@ -697,7 +742,7 @@ def run_single_evaluation(
             and (total_experiments == config.num_total_experiments)
         )
         status = "completed" if parsed_full_eval else "failed"
-        
+
         print(f"\n{'='*80}")
         print(f"TASK {status.upper()}: {task_suite} - Task {task_id}")
         print(f"{'='*80}")
@@ -713,7 +758,7 @@ def run_single_evaluation(
             print(f"⚠ Metrics: {warning}")
         print(f"Execution Time: {end_time - start_time:.1f}s")
         print(f"{'='*80}\n")
-        
+
         return {
             "task_suite": task_suite,
             "task_id": task_id,
@@ -822,10 +867,18 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "task_environment": config.task if config.task else "auto",
             "num_total_experiments": config.num_total_experiments,
             "num_success_steps": config.num_success_steps,
-            "episode_metrics_schema_version": 2,
+            "episode_metrics_schema_version": 3,
             "replan_steps": config.replan_steps,
+            "lift_height_threshold_m": config.lift_height_threshold_m,
+            "lift_hold_steps": config.lift_hold_steps,
             "record_step_traces": config.record_step_traces,
             "step_trace_dir": str(config.step_trace_dir) if config.step_trace_dir is not None else None,
+            "record_videos": config.record_videos,
+            "record_camera_output_path": (
+                str(config.record_camera_output_path)
+                if config.record_camera_output_path is not None
+                else None
+            ),
             "prompt_mode": prompt_mode,
             "prompt_adverb": config.prompt_adverb,
             "prompt_adverbs": list(config.prompt_adverbs),
@@ -877,7 +930,7 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "metrics_warnings": result.get("metrics_warnings", ["episode metrics were not provided"]),
             "step_statistics": result.get("step_statistics", summarize_step_statistics([])),
             "force_metric_episode_counts": result.get(
-                "force_metric_episode_counts", {key: 0 for key in FORCE_METRIC_KEYS}
+                "force_metric_episode_counts", dict.fromkeys(FORCE_METRIC_KEYS, 0)
             ),
             "damage_threshold_statistics": result.get(
                 "damage_threshold_statistics", {}
@@ -1635,6 +1688,13 @@ def resolve_step_trace_root(
 def main():
     """Main entry point."""
     config = tyro.cli(EvaluationConfig)
+    if (
+        not math.isfinite(config.lift_height_threshold_m)
+        or config.lift_height_threshold_m <= 0.0
+    ):
+        raise ValueError("--lift-height-threshold-m must be finite and positive")
+    if isinstance(config.lift_hold_steps, bool) or config.lift_hold_steps <= 0:
+        raise ValueError("--lift-hold-steps must be a positive integer")
 
     workspace_root = Path(__file__).parent.parent.parent.resolve()
     config.output_dir.mkdir(parents=True, exist_ok=True)

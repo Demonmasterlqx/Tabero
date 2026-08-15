@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -85,6 +84,21 @@ def test_openpi_camera_names_cli_accepts_multiple_values():
     assert annotation == "tuple[str, ...]"
 
 
+def test_openpi_command_passes_lift_detection_contract():
+    config = rte.EvaluationConfig(
+        policy_model="openpi",
+        lift_height_threshold_m=0.03,
+        lift_hold_steps=5,
+    )
+
+    command = rte.build_command(config, "libero_object", 0)
+
+    assert "--lift_height_threshold_m" in command
+    assert command[command.index("--lift_height_threshold_m") + 1] == "0.03"
+    assert "--lift_hold_steps" in command
+    assert command[command.index("--lift_hold_steps") + 1] == "5"
+
+
 def test_openpi_osc_actions_are_sent_as_7d_actions():
     source = (ROOT / "benchmarks/openpi/openpi_inference_client.py").read_text()
 
@@ -114,6 +128,35 @@ def test_openpi_sim_launcher_args_are_passed_to_client_command():
     assert "--sim_multi_gpu" in cmd
     assert "--sim_kit_args" not in cmd
     assert "--sim_kit_args=--/renderer/activeGpu=8" in cmd
+
+
+def test_openpi_video_args_are_passed_to_task_specific_directory(tmp_path):
+    config = rte.EvaluationConfig(
+        policy_model="openpi",
+        output_dir=tmp_path / "raw",
+        record_videos=True,
+    )
+
+    cmd = rte.build_command(config, "libero_object", 0)
+
+    assert "--record_videos" in cmd
+    output_index = cmd.index("--record_camera_output_path") + 1
+    assert cmd[output_index] == str(
+        tmp_path / "raw/videos/libero_object_task0"
+    )
+
+
+def test_openpi_video_args_honor_explicit_output_directory(tmp_path):
+    video_dir = tmp_path / "videos"
+    config = rte.EvaluationConfig(
+        policy_model="openpi",
+        record_videos=True,
+        record_camera_output_path=video_dir,
+    )
+
+    cmd = rte.build_command(config, "libero_object", 0)
+
+    assert cmd[cmd.index("--record_camera_output_path") + 1] == str(video_dir)
 
 
 def test_config_path_is_passed_to_openpi_client_and_isaac_environment(monkeypatch, tmp_path):
@@ -328,9 +371,7 @@ def test_nonzero_exit_with_complete_success_and_episode_metrics_is_completed(mon
     assert result["metrics_status"] == "complete"
     assert [episode["success"] for episode in result["episodes"]] == [True, False]
     assert result["step_statistics"]["all"]["env_steps_total"] == 31
-    assert result["force_metric_episode_counts"] == {
-        key: 1 for key in rte.FORCE_METRIC_KEYS
-    }
+    assert result["force_metric_episode_counts"] == dict.fromkeys(rte.FORCE_METRIC_KEYS, 1)
 
 
 def test_duplicate_missing_and_partial_force_records_do_not_change_success_status(monkeypatch):
@@ -404,6 +445,13 @@ def test_step_trace_cli_resolution_command_and_validation(tmp_path):
                 "ap_meas": 0.0,
                 "predicted_contact": True,
                 "measured_contact": True,
+                "target_contact_override_enabled": True,
+                "target_contact_detected": bool(step),
+                "target_contact_override_latched": bool(step),
+                "target_contact_activation_step": 1 if step else -1,
+                "target_contact_force_norm": float(step),
+                "effective_single_finger_target_n": 13.0 if step else 2.0,
+                "effective_squeeze_target_n": 26.0 if step else 4.0,
             }
         )
     trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -476,7 +524,7 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
         "metrics_status": "complete",
         "metrics_warnings": [],
         "step_statistics": rte.summarize_step_statistics([episode]),
-        "force_metric_episode_counts": {key: 0 for key in rte.FORCE_METRIC_KEYS},
+        "force_metric_episode_counts": dict.fromkeys(rte.FORCE_METRIC_KEYS, 0),
         "damage_threshold_statistics": rte.summarize_damage_threshold_statistics(
             [episode]
         ),
@@ -491,7 +539,7 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
     rte.save_success_rates_txt([result], txt_path, config)
 
     json_result = json.loads(json_path.read_text())
-    assert json_result["metadata"]["episode_metrics_schema_version"] == 2
+    assert json_result["metadata"]["episode_metrics_schema_version"] == 3
     task = json_result["results"]["libero_object_task1"]
     text = txt_path.read_text()
     assert task["metrics_status"] == "complete"

@@ -7,12 +7,12 @@ import contextlib
 import hashlib
 import json
 import os
-import sys
 import re
-from datetime import datetime
+import sys
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -43,11 +43,13 @@ from benchmarks.common.episode_metrics import (
     resolve_episode_termination,
     summarize_episode_force_metrics,
 )
+from benchmarks.common.episode_lift import EpisodeLiftTracker
+from benchmarks.common.episode_video import EpisodeVideoWriter
 from benchmarks.common.metrics import (
     compute_contact_force_series_from_lr_forces,
+    compute_topk_mean,
 )
 from benchmarks.openpi.openpi_payload import infer_openpi_step
-
 
 TARGET_IMAGE_HW = (224, 224)
 
@@ -100,6 +102,36 @@ def _finite_float_or_none(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if np.isfinite(result) else None
+
+
+def _bool_or_none(value) -> bool | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        scalar = np.asarray(value).reshape(()).item()
+    except (TypeError, ValueError):
+        return None
+    if isinstance(scalar, (bool, np.bool_)):
+        return bool(scalar)
+    return None
+
+
+def _integer_or_none(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        scalar = np.asarray(value).reshape(()).item()
+    except (TypeError, ValueError):
+        return None
+    if isinstance(scalar, (int, np.integer)) and not isinstance(
+        scalar, (bool, np.bool_)
+    ):
+        return int(scalar)
+    return None
 
 
 def _contact_or_none(left: list[float] | None, right: list[float] | None) -> bool | None:
@@ -301,6 +333,9 @@ class OpenpiClientArguments(ClosedLoopArguments):
     max_inference_steps: int = 30  # max number of inference steps to run
     num_success_steps: int = 8  # continuous success steps to consider the policy as successful
     num_total_experiments: int = 50  # total number of experiments to do policy evaluation
+    # A lift is a post-contact height increase held for consecutive env steps.
+    lift_height_threshold_m: float = 0.03
+    lift_hold_steps: int = 5
 
     # Control mode parameters
     # Supported modes:
@@ -347,6 +382,10 @@ class OpenpiClientArguments(ClosedLoopArguments):
 
 # Parse arguments first to get task_suite and task_id
 args = tyro.cli(OpenpiClientArguments)
+if not np.isfinite(args.lift_height_threshold_m) or args.lift_height_threshold_m <= 0.0:
+    raise ValueError("lift_height_threshold_m must be finite and positive")
+if isinstance(args.lift_hold_steps, bool) or args.lift_hold_steps <= 0:
+    raise ValueError("lift_hold_steps must be a positive integer")
 os.environ["LIBERO_RANDOMIZE_LIGHT"] = "1" if args.randomize_light else "0"
 
 
@@ -600,13 +639,34 @@ def run_closed_loop_policy(  # noqa: C901
         except Exception as e:
             print(f"[DebugMode 6] Failed to write run_meta.json: {e}")
 
+    video_output_dir: Path | None = None
+    video_fps = 20.0
+    if args.record_videos:
+        video_output_dir = Path(
+            args.record_camera_output_path
+            or (project_root / "evaluation_results" / "episode_videos")
+        )
+        video_output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            step_dt = float(env.unwrapped.step_dt)
+            if np.isfinite(step_dt) and step_dt > 0.0:
+                video_fps = 1.0 / step_dt
+        except Exception:
+            pass
+        print(
+            f"[Video] Recording every env step to {video_output_dir} "
+            f"at {video_fps:.3f} FPS."
+        )
+
     # Hybrid 力–位混合在线可视化（仅在 debug_mode == 4 时启用）
     force_viz = None
     if args.debug_mode == 4 and "Isaac-Libero-Franka-Hybrid-" in args.task and args.num_envs == 1:
         try:
             # 复用 scripts/tools 中的调试可视化工具
             # 注意：此处从工程根目录下的 scripts.tools.common 导入，而不是相对路径的 common。
-            from scripts.tools.common.force_position_debug_viz import ForcePositionDebugVisualizer
+            from scripts.tools.common.force_position_debug_viz import (
+                ForcePositionDebugVisualizer,
+            )
 
             force_viz = ForcePositionDebugVisualizer()
             print("[DebugMode 4] Enabled Hybrid force-position debug visualizer.")
@@ -664,6 +724,7 @@ def run_closed_loop_policy(  # noqa: C901
     with open(task_config_path) as f:
         task_suite_config = json.load(f)
 
+    selected_task_config: dict | None = None
     cli_instruction = (args.language_instruction or "").strip()
     if cli_instruction:
         print(f"\nUsing language instruction (from CLI): {cli_instruction}")
@@ -672,9 +733,34 @@ def run_closed_loop_policy(  # noqa: C901
         for task in task_suite_config["tasks"]:
             task_id = task["task_id"]
             if task_id == args.task_id:
+                selected_task_config = task
                 args.language_instruction = task["language_instruction"]
                 print(f"\nUsing language instruction (from task config): {args.language_instruction}")
                 break
+
+    if selected_task_config is None:
+        selected_task_config = next(
+            (
+                task
+                for task in task_suite_config["tasks"]
+                if task["task_id"] == args.task_id
+            ),
+            None,
+        )
+    lift_target_object: str | None = None
+    if selected_task_config is not None:
+        target_override = (
+            selected_task_config.get("control_overrides", {})
+            .get("target_contact_squeeze", {})
+        )
+        if target_override.get("enabled") is True:
+            target_object = target_override.get("target_object")
+            if not isinstance(target_object, str) or not target_object:
+                raise ValueError(
+                    "enabled target_contact_squeeze requires a non-empty "
+                    "target_object for lift tracking"
+                )
+            lift_target_object = target_object
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.server_host, args.server_port)
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
@@ -700,9 +786,28 @@ def run_closed_loop_policy(  # noqa: C901
             exp_fL_meas_values: list[np.ndarray] = []
             exp_fR_meas_values: list[np.ndarray] = []
 
+            # JSON-configured target-contact squeeze override audit.
+            exp_override_configured = False
+            exp_override_activated = False
+            exp_override_activation_step: int | None = None
+            exp_override_active_steps = 0
+            exp_override_contact_steps = 0
+            exp_override_single_finger_target_n: float | None = None
+            exp_override_squeeze_target_n: float | None = None
+            exp_override_left_normal_abs: list[float] = []
+            exp_override_right_normal_abs: list[float] = []
+            lift_tracker: EpisodeLiftTracker | None = None
+            lift_object = None
+
             # 当前 experiment 的 Hybrid 13D 动作缓存。
             exp_actions_13d: list[torch.Tensor] = []
             exp_step_trace_rows: list[dict] = []
+
+            episode_video = (
+                EpisodeVideoWriter(video_output_dir, exp_idx, video_fps)
+                if video_output_dir is not None
+                else None
+            )
 
             # debug_mode=6: per-experiment capture directories + force log (JSONL)
             mode6_exp_dir: Path | None = None
@@ -752,6 +857,22 @@ def run_closed_loop_policy(  # noqa: C901
             else:
                 # Fallback to default reset if no dataset file specified or doesn't exist
                 obs, info = env.reset()
+
+            if lift_target_object is not None:
+                if lift_target_object not in env.unwrapped.scene.keys():
+                    raise RuntimeError(
+                        f"Lift target {lift_target_object!r} is missing from the scene"
+                    )
+                lift_object = env.unwrapped.scene[lift_target_object]
+                initial_height_m = float(
+                    lift_object.data.root_pos_w[0, 2].detach().cpu().item()
+                )
+                lift_tracker = EpisodeLiftTracker(
+                    target_object=lift_target_object,
+                    initial_height_m=initial_height_m,
+                    height_threshold_m=float(args.lift_height_threshold_m),
+                    hold_steps_required=int(args.lift_hold_steps),
+                )
 
             friction_snapshot = extract_friction_snapshot(info=info, env_index=0)
             damage_threshold_snapshot = extract_damage_threshold_snapshot(
@@ -1011,6 +1132,20 @@ def run_closed_loop_policy(  # noqa: C901
                     step_squeeze_meas = None
                     step_ap_pred = None
                     step_ap_meas = None
+                    step_override_enabled = False
+                    step_target_contact_detected = False
+                    step_override_latched = False
+                    step_override_activation_step = None
+                    step_effective_single_finger_target = None
+                    step_effective_squeeze_target = None
+                    step_target_contact_force_norm = None
+                    step_lift_state = {
+                        "target_object_height_m": None,
+                        "target_object_lift_delta_m": None,
+                        "target_object_above_lift_threshold": False,
+                        "target_object_lift_hold_count": 0,
+                        "target_object_lifted": False,
+                    }
 
                     # 若为 Hybrid 控制模式，则缓存 13D 动作以便后续计算 metrics
                     if args.control_mode in ("hybrid", "tactile"):
@@ -1068,6 +1203,76 @@ def run_closed_loop_policy(  # noqa: C901
                             if step_fL_meas is not None and step_fR_meas is not None:
                                 exp_fL_meas_values.append(np.asarray(step_fL_meas, dtype=np.float32))
                                 exp_fR_meas_values.append(np.asarray(step_fR_meas, dtype=np.float32))
+
+                            step_override_enabled = bool(
+                                _bool_or_none(
+                                    debug.get("target_contact_override_enabled")
+                                )
+                            )
+                            step_target_contact_detected = bool(
+                                _bool_or_none(debug.get("target_contact_detected"))
+                            )
+                            step_override_latched = bool(
+                                _bool_or_none(
+                                    debug.get(
+                                        "target_contact_override_latched"
+                                    )
+                                )
+                            )
+                            step_override_activation_step = _integer_or_none(
+                                debug.get("target_contact_activation_step")
+                            )
+                            step_effective_single_finger_target = (
+                                _finite_float_or_none(
+                                    debug.get(
+                                        "target_contact_single_finger_target"
+                                    )
+                                )
+                            )
+                            step_effective_squeeze_target = _finite_float_or_none(
+                                debug.get("target_contact_squeeze_target")
+                            )
+                            step_target_contact_force_norm = _finite_float_or_none(
+                                debug.get("target_contact_force_norm")
+                            )
+
+                            if step_override_enabled:
+                                exp_override_configured = True
+                                exp_override_single_finger_target_n = (
+                                    _finite_float_or_none(
+                                        debug.get(
+                                            "target_contact_configured_single_finger_force"
+                                        )
+                                    )
+                                )
+                                exp_override_squeeze_target_n = (
+                                    _finite_float_or_none(
+                                        debug.get(
+                                            "target_contact_configured_squeeze_force"
+                                        )
+                                    )
+                                )
+                                exp_override_contact_steps += int(
+                                    step_target_contact_detected
+                                )
+                                if step_override_latched:
+                                    exp_override_activated = True
+                                    exp_override_active_steps += 1
+                                    if (
+                                        step_override_activation_step is not None
+                                        and step_override_activation_step >= 0
+                                    ):
+                                        exp_override_activation_step = (
+                                            step_override_activation_step
+                                        )
+                                    if step_fL_meas is not None:
+                                        exp_override_left_normal_abs.append(
+                                            abs(float(step_fL_meas[2]))
+                                        )
+                                    if step_fR_meas is not None:
+                                        exp_override_right_normal_abs.append(
+                                            abs(float(step_fR_meas[2]))
+                                        )
                         except Exception:
                             pass
                     elif args.control_mode == "binary":
@@ -1128,6 +1333,19 @@ def run_closed_loop_policy(  # noqa: C901
                             # 可视化失败不应中断主流程
                             pass
 
+                    if lift_tracker is not None and lift_object is not None:
+                        object_height_m = float(
+                            lift_object.data.root_pos_w[0, 2]
+                            .detach()
+                            .cpu()
+                            .item()
+                        )
+                        step_lift_state = lift_tracker.update(
+                            step_index=total_steps_taken,
+                            object_height_m=object_height_m,
+                            contact_latched=step_override_latched,
+                        )
+
                     total_steps_taken += 1
 
                     if args.step_trace_path is not None:
@@ -1151,8 +1369,68 @@ def run_closed_loop_policy(  # noqa: C901
                                 "ap_meas": step_ap_meas,
                                 "predicted_contact": _contact_or_none(step_fL_pred, step_fR_pred),
                                 "measured_contact": _contact_or_none(step_fL_meas, step_fR_meas),
+                                "target_contact_override_enabled": step_override_enabled,
+                                "target_contact_detected": step_target_contact_detected,
+                                "target_contact_override_latched": step_override_latched,
+                                "target_contact_activation_step": step_override_activation_step,
+                                "target_contact_force_norm": step_target_contact_force_norm,
+                                "effective_single_finger_target_n": step_effective_single_finger_target,
+                                "effective_squeeze_target_n": step_effective_squeeze_target,
+                                **step_lift_state,
                             }
                         )
+
+                    if episode_video is not None:
+                        try:
+                            video_frames: list[tuple[str, np.ndarray]] = []
+                            for camera_name in args.camera_names:
+                                camera = env.unwrapped.scene[camera_name]
+                                rgb = camera.data.output["rgb"][0]
+                                video_frames.append(
+                                    (camera_name, _to_uint8_rgb(rgb))
+                                )
+                            left_normal = (
+                                abs(float(step_fL_meas[2]))
+                                if step_fL_meas is not None
+                                else float("nan")
+                            )
+                            right_normal = (
+                                abs(float(step_fR_meas[2]))
+                                if step_fR_meas is not None
+                                else float("nan")
+                            )
+                            lift_delta = step_lift_state[
+                                "target_object_lift_delta_m"
+                            ]
+                            lift_delta_text = (
+                                f"{float(lift_delta):.3f}"
+                                if lift_delta is not None
+                                else "N/A"
+                            )
+                            episode_video.write(
+                                video_frames,
+                                [
+                                    f"episode={exp_idx:03d} step={total_steps_taken - 1}",
+                                    (
+                                        "target_contact="
+                                        f"{int(step_target_contact_detected)} "
+                                        f"latched={int(step_override_latched)}"
+                                    ),
+                                    (
+                                        "target_single="
+                                        f"{step_effective_single_finger_target!s} N "
+                                        "meas_abs_z="
+                                        f"({left_normal:.2f},{right_normal:.2f}) N"
+                                    ),
+                                    (
+                                        f"lift_delta={lift_delta_text} m "
+                                        "lifted="
+                                        f"{int(step_lift_state['target_object_lifted'])}"
+                                    ),
+                                ],
+                            )
+                        except Exception as exc:
+                            episode_video.error = str(exc)
 
                     if terminated[0] or truncated[0]:
                         experiment_success = False
@@ -1363,6 +1641,69 @@ def run_closed_loop_policy(  # noqa: C901
                 fR_meas_values=exp_fR_meas_values,
             )
 
+            def _mean_or_none(values: list[float]) -> float | None:
+                return float(np.mean(values)) if values else None
+
+            force_override_summary = {
+                "configured": bool(exp_override_configured),
+                "activated": bool(exp_override_activated),
+                "activation_step": exp_override_activation_step,
+                "active_steps": int(exp_override_active_steps),
+                "target_contact_steps": int(exp_override_contact_steps),
+                "single_finger_target_n": exp_override_single_finger_target_n,
+                "squeeze_target_n": exp_override_squeeze_target_n,
+                "left_normal_abs_avg_n": _mean_or_none(
+                    exp_override_left_normal_abs
+                ),
+                "right_normal_abs_avg_n": _mean_or_none(
+                    exp_override_right_normal_abs
+                ),
+                "left_normal_abs_top5_n": (
+                    compute_topk_mean(exp_override_left_normal_abs, frac=0.05)
+                    if exp_override_left_normal_abs
+                    else None
+                ),
+                "right_normal_abs_top5_n": (
+                    compute_topk_mean(exp_override_right_normal_abs, frac=0.05)
+                    if exp_override_right_normal_abs
+                    else None
+                ),
+            }
+            lift_summary = (
+                lift_tracker.summary()
+                if lift_tracker is not None
+                else {
+                    "enabled": False,
+                    "target_object": None,
+                    "initial_height_m": None,
+                    "max_height_m": None,
+                    "max_height_delta_m": None,
+                    "height_threshold_m": float(args.lift_height_threshold_m),
+                    "hold_steps_required": int(args.lift_hold_steps),
+                    "above_threshold_steps": 0,
+                    "max_consecutive_above_threshold_steps": 0,
+                    "first_above_threshold_step": None,
+                    "lift_confirmed_step": None,
+                    "lifted": False,
+                }
+            )
+
+            if episode_video is not None:
+                video_summary = episode_video.finalize(
+                    success=experiment_success,
+                    end_reason=end_reason,
+                    expected_frames=total_steps_taken,
+                )
+            else:
+                video_summary = {
+                    "enabled": False,
+                    "status": "disabled",
+                    "path": None,
+                    "frames": 0,
+                    "fps": None,
+                    "error": None,
+                }
+
             trace_status = "disabled"
             trace_rows_written = 0
             trace_error = step_trace_open_error
@@ -1396,6 +1737,9 @@ def run_closed_loop_policy(  # noqa: C901
                 "env_steps": int(total_steps_taken),
                 "inference_chunks": int(inference_chunks_taken),
                 **force_summary,
+                "force_override": force_override_summary,
+                "lift": lift_summary,
+                "video": video_summary,
                 "trace_status": trace_status,
                 "trace_rows": int(trace_rows_written),
                 "trace_error": trace_error,
