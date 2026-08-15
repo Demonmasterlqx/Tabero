@@ -9,16 +9,20 @@ import os
 from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
-from isaaclab.devices.device_base import DevicesCfg
-from isaaclab.devices.keyboard import Se3KeyboardCfg
-from isaaclab.devices.openxr import OpenXRDevice, OpenXRDeviceCfg
-from isaaclab.devices.openxr.retargeters import GripperRetargeterCfg, Se3RelRetargeterCfg
-from isaaclab.devices.spacemouse import Se3SpaceMouseCfg
 from isaaclab.actuators.actuator_cfg import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.controllers.operational_space_cfg import OperationalSpaceControllerCfg
-from isaaclab.envs import ManagerBasedRLEnvCfg, mdp as isaaclab_mdp
+from isaaclab.devices.device_base import DevicesCfg
+from isaaclab.devices.keyboard import Se3KeyboardCfg
+from isaaclab.devices.openxr import OpenXRDevice, OpenXRDeviceCfg
+from isaaclab.devices.openxr.retargeters import (
+    GripperRetargeterCfg,
+    Se3RelRetargeterCfg,
+)
+from isaaclab.devices.spacemouse import Se3SpaceMouseCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.envs import mdp as isaaclab_mdp
 from isaaclab.envs.mdp.actions.actions_cfg import (
     DifferentialInverseKinematicsActionCfg,
     OperationalSpaceControllerActionCfg,
@@ -38,6 +42,9 @@ from isaaclab.utils.assets import NVIDIA_NUCLEUS_DIR
 from isaaclab_tasks.manager_based.manipulation.stack.mdp import franka_stack_events
 
 from tac_manip.tasks.manipulation.libero import mdp
+from tac_manip.tasks.manipulation.libero.control_config import (
+    parse_target_contact_squeeze_override,
+)
 from tac_manip.tasks.manipulation.libero.physics_config import (
     FixedDamageThresholdConfig,
     FixedFrictionConfig,
@@ -50,7 +57,6 @@ from tac_manip.tasks.manipulation.libero.physics_config import (
     parse_object_friction_configs,
     parse_object_mass_configs,
 )
-from tac_manip.core.sensors import GripperContactSensorCfg
 
 ##
 # Pre-defined configs
@@ -97,6 +103,9 @@ class LiberoTaskConfig:
             self.gripper_friction_config = parse_gripper_friction_config(self.task_info)
             self.object_friction_configs = parse_object_friction_configs(self.task_info)
             self.object_damage_configs = parse_object_damage_configs(self.task_info)
+            self.target_contact_squeeze_override = (
+                parse_target_contact_squeeze_override(self.task_info)
+            )
 
             # add targets for tactile sensor
             self.tactile_targets = self.task_info.get("tactile_targets", self.obj_of_interest)
@@ -543,6 +552,7 @@ class JointPositionLiberoEnvCfg(LiberoEnvCfg):
             max_depenetration_velocity=5.0,
             disable_gravity=False,
         )
+        squeeze_override = self.libero_config.target_contact_squeeze_override
 
         # add all objects
         for obj in self.libero_config.objects.items():
@@ -715,6 +725,11 @@ class JointPositionLiberoEnvCfg(LiberoEnvCfg):
                             usd_path=f"{self.libero_config.assets_dir}/{obj_type}/{obj_type}.usd",
                             activate_contact_sensors=(
                                 obj_name in self.libero_config.targets
+                                or (
+                                    squeeze_override is not None
+                                    and obj_name
+                                    == squeeze_override.target_object
+                                )
                             ),  # need to activate contact sensor for target object
                             scale=obj[1]["scale"],
                             mass_props=fixed_mass_props,
@@ -793,6 +808,30 @@ class JointPositionLiberoEnvCfg(LiberoEnvCfg):
                     history_length=6,
                     debug_vis=False,
                     filter_prim_paths_expr=["{ENV_REGEX_NS}/" + f"{obj}"],
+                ),
+            )
+
+        # Optional target-centric sensor used only to gate the fixed-squeeze
+        # control override.  Keeping the target object as the single sensor
+        # body and the two actual GelSight contact bodies as filters avoids
+        # ContactSensor's unsupported many-sensor-bodies-to-one-filter
+        # topology.  The rigid gelpads attribute contact to their parent
+        # ``gelsight_mini_case_*`` bodies, not the Panda finger links.
+        if squeeze_override is not None:
+            setattr(
+                self.scene,
+                f"contact_target_squeeze_{squeeze_override.target_object}",
+                ContactSensorCfg(
+                    prim_path=(
+                        "{ENV_REGEX_NS}/" + squeeze_override.target_object
+                    ),
+                    update_period=0.0,
+                    history_length=1,
+                    debug_vis=False,
+                    filter_prim_paths_expr=[
+                        "{ENV_REGEX_NS}/Robot/gelsight_mini_case_left",
+                        "{ENV_REGEX_NS}/Robot/gelsight_mini_case_right",
+                    ],
                 ),
             )
 
@@ -1056,8 +1095,8 @@ class IKLiberoCameraEnvCfg(JointPositionLiberoCameraEnvCfg):
             joint_names=["panda_joint.*"],
             body_name="panda_hand",
             controller=DifferentialIKControllerCfg(
-                command_type="pose", 
-                use_relative_mode=self.use_relative_mode, 
+                command_type="pose",
+                use_relative_mode=self.use_relative_mode,
                 ik_method="dls",
             ),
             scale=1.0,
