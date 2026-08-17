@@ -479,7 +479,8 @@ class ForcePositionTactileLiberoCameraEnvCfg(JointPositionTactileLiberoCameraEnv
         # NOTE: PhysX GPU attributes FixedJoint child body (gelpad) contact forces to the
         # parent articulation link (finger). Bind to finger to get correct force readings.
         self.scene.contact_gripper = GripperContactSensorCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/gelsight_mini_case_.*",
+            # prim_path="{ENV_REGEX_NS}/Robot/gelsight_mini_case_.*",
+            prim_path="{ENV_REGEX_NS}/Robot/panda_.*finger",
             update_period=0.0,
             history_length=RECORD_FORCE_HISTORY_LENGTH,
             debug_vis=False,

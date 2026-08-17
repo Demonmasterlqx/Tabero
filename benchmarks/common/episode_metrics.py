@@ -179,6 +179,192 @@ class TrajectoryForceTracker:
         }
 
 
+def summarize_force_tracking_metrics(
+    *,
+    expected_steps: int,
+    reward_valid_steps: Sequence[Any],
+    predicted_squeeze_values: Sequence[Any],
+    effective_squeeze_target_values: Sequence[Any],
+    measured_squeeze_raw_values: Sequence[Any],
+    gripper_pred_values: Sequence[Any],
+    gripper_cmd_values: Sequence[Any],
+    gripper_closed_limit_m: float,
+    gripper_open_limit_m: float,
+    saturation_epsilon_m: float = 1.0e-8,
+) -> dict[str, Any]:
+    """Summarize force-target tracking on a strictly aligned step population.
+
+    The legacy ``squeeze_avg_pred`` and ``squeeze_avg_meas`` fields intentionally
+    retain their historical whole-trajectory semantics.  This additive summary
+    instead compares raw model target, controller-effective target, and raw
+    measured squeeze on the exact reward-valid steps.  It also reports when the
+    final gripper position command is clamped at either position limit.
+    """
+
+    if type(expected_steps) is not int or expected_steps < 0:
+        raise ValueError("expected_steps must be a non-negative integer")
+    sequences = {
+        "reward_valid_steps": reward_valid_steps,
+        "predicted_squeeze_values": predicted_squeeze_values,
+        "effective_squeeze_target_values": effective_squeeze_target_values,
+        "measured_squeeze_raw_values": measured_squeeze_raw_values,
+        "gripper_pred_values": gripper_pred_values,
+        "gripper_cmd_values": gripper_cmd_values,
+    }
+    mismatched = {
+        name: len(values)
+        for name, values in sequences.items()
+        if len(values) != expected_steps
+    }
+    if mismatched:
+        raise ValueError(
+            "force-tracking sequences must match expected_steps; got "
+            f"expected_steps={expected_steps}, lengths={mismatched}"
+        )
+    for name, value in (
+        ("gripper_closed_limit_m", gripper_closed_limit_m),
+        ("gripper_open_limit_m", gripper_open_limit_m),
+        ("saturation_epsilon_m", saturation_epsilon_m),
+    ):
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{name} must be finite")
+    closed_limit = float(gripper_closed_limit_m)
+    open_limit = float(gripper_open_limit_m)
+    saturation_epsilon = float(saturation_epsilon_m)
+    if open_limit <= closed_limit:
+        raise ValueError("gripper_open_limit_m must exceed gripper_closed_limit_m")
+    if saturation_epsilon < 0.0:
+        raise ValueError("saturation_epsilon_m must be non-negative")
+
+    available_rows: list[tuple[bool, float, float, float, float, float]] = []
+    unavailable_steps = 0
+    reward_valid_total = 0
+    for index in range(expected_steps):
+        valid_step = bool(reward_valid_steps[index])
+        reward_valid_total += int(valid_step)
+        numeric_values: list[float] = []
+        for values in (
+            predicted_squeeze_values,
+            effective_squeeze_target_values,
+            measured_squeeze_raw_values,
+            gripper_pred_values,
+            gripper_cmd_values,
+        ):
+            value = values[index]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                break
+            numeric_value = float(value)
+            if not math.isfinite(numeric_value):
+                break
+            numeric_values.append(numeric_value)
+        if len(numeric_values) != 5:
+            unavailable_steps += 1
+            continue
+        available_rows.append((valid_step, *numeric_values))
+
+    valid_rows = [row for row in available_rows if row[0]]
+    lower_saturated = [
+        row for row in available_rows if row[5] <= closed_limit + saturation_epsilon
+    ]
+    upper_saturated = [
+        row for row in available_rows if row[5] >= open_limit - saturation_epsilon
+    ]
+    valid_lower_saturated = [
+        row for row in valid_rows if row[5] <= closed_limit + saturation_epsilon
+    ]
+    valid_upper_saturated = [
+        row for row in valid_rows if row[5] >= open_limit - saturation_epsilon
+    ]
+
+    def _mean(values: Sequence[float]) -> float | None:
+        return float(np.mean(np.asarray(values, dtype=np.float64))) if values else None
+
+    def _rmse(values: Sequence[float]) -> float | None:
+        if not values:
+            return None
+        array = np.asarray(values, dtype=np.float64)
+        return float(np.sqrt(np.mean(np.square(array))))
+
+    predicted_valid = [row[1] for row in valid_rows]
+    effective_valid = [row[2] for row in valid_rows]
+    measured_valid = [row[3] for row in valid_rows]
+    model_errors = [
+        predicted - measured
+        for predicted, measured in zip(predicted_valid, measured_valid)
+    ]
+    effective_errors = [
+        effective - measured
+        for effective, measured in zip(effective_valid, measured_valid)
+    ]
+    available_steps = len(available_rows)
+    valid_available_steps = len(valid_rows)
+    if expected_steps == 0 or available_steps == 0:
+        status = "unavailable"
+    elif available_steps == expected_steps and valid_available_steps == reward_valid_total:
+        status = "complete"
+    else:
+        status = "partial"
+
+    return {
+        "status": status,
+        "semantics": {
+            "population": "reward_force_valid_step",
+            "predicted": "raw_model_squeeze_target",
+            "effective_target": "controller_target_after_feed_forward_or_override",
+            "measured": "raw_unfiltered_gripper_local_squeeze",
+        },
+        "sample_counts": {
+            "env_steps": int(expected_steps),
+            "available_steps": int(available_steps),
+            "unavailable_steps": int(unavailable_steps),
+            "reward_valid_steps": int(reward_valid_total),
+            "reward_valid_available_steps": int(valid_available_steps),
+        },
+        "reward_valid": {
+            "mean_predicted_squeeze_n": _mean(predicted_valid),
+            "mean_effective_squeeze_target_n": _mean(effective_valid),
+            "mean_measured_squeeze_raw_n": _mean(measured_valid),
+            "mean_model_target_error_n": _mean(model_errors),
+            "mean_effective_target_error_n": _mean(effective_errors),
+            "effective_target_mae_n": _mean([abs(value) for value in effective_errors]),
+            "effective_target_rmse_n": _rmse(effective_errors),
+        },
+        "gripper_position_command": {
+            "closed_limit_m": closed_limit,
+            "open_limit_m": open_limit,
+            "saturation_epsilon_m": saturation_epsilon,
+            "lower_saturation_steps": int(len(lower_saturated)),
+            "upper_saturation_steps": int(len(upper_saturated)),
+            "lower_saturation_ratio": (
+                float(len(lower_saturated)) / float(available_steps)
+                if available_steps
+                else None
+            ),
+            "upper_saturation_ratio": (
+                float(len(upper_saturated)) / float(available_steps)
+                if available_steps
+                else None
+            ),
+            "reward_valid_lower_saturation_steps": int(
+                len(valid_lower_saturated)
+            ),
+            "reward_valid_upper_saturation_steps": int(
+                len(valid_upper_saturated)
+            ),
+            "reward_valid_lower_saturation_ratio": (
+                float(len(valid_lower_saturated)) / float(valid_available_steps)
+                if valid_available_steps
+                else None
+            ),
+            "reward_valid_upper_saturation_ratio": (
+                float(len(valid_upper_saturated)) / float(valid_available_steps)
+                if valid_available_steps
+                else None
+            ),
+        },
+    }
+
+
 def resolve_episode_termination(
     *,
     info: Any,

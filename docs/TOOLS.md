@@ -269,6 +269,56 @@ The JSON result keeps the existing task-level force fields unchanged and adds `m
 
 The eight force metrics remain success-only at task level. Each episode records the same fields for success or failure: `squeeze_avg_pred`, `squeeze_avg_meas`, `squeeze_max_pred`, `squeeze_max_meas`, `ap_avg_pred`, `ap_avg_meas`, `ap_max_pred`, and `ap_max_meas`. The `max` metrics are the mean of the largest 5% of nonzero-force frames, not a single-frame maximum. Tactile/hybrid expects full predicted and measured coverage; binary may omit predicted force; diffik/osc reports force as `not_applicable` while still recording steps.
 
+### `export_mode6_five_panel_video.py`
+
+Composes an existing OpenPI `debug_mode=6` experiment capture into one five-panel video:
+
+1. agentview;
+2. eye-in-hand;
+3. left GelSight `markers_rgb`;
+4. right GelSight `markers_rgb`;
+5. stacked cumulative curves for raw model squeeze target / controller-effective target /
+   measured squeeze and raw model `d_pred` / final controller `d_cmd` / measured `d_actual`.
+
+This is offline post-processing: it does not start Isaac or the policy server and does not
+modify the recorded evaluation. The four PNG streams and `forces.jsonl` must contain exactly
+the same contiguous frame indices starting at zero. A successful episode may have one fewer
+debug frame than `env_steps`; the exporter preserves that recorded boundary and never
+synthesizes a terminal frame.
+
+```bash
+python scripts/tools/export_mode6_five_panel_video.py \
+  --capture-exp-dir /path/to/capture_mode6/libero_object/task_0/none/<timestamp>/exp_000 \
+  --step-trace /path/to/traces/libero_object_task0.jsonl \
+  --output /path/to/combined_5view_force_gripper_curve.mp4 \
+  --fps 20 \
+  --width 1920 \
+  --height 1080
+```
+
+The output is H.264/YUV420P. The tool verifies codec, pixel format, dimensions, frame rate,
+and frame count with FFprobe, then writes `combined_5view_force_curve.manifest.json` by
+default. Existing video or manifest files are rejected unless `--overwrite` is passed.
+
+Force semantics are deliberately explicit. Mode-6 scalar schema v3 records raw model
+`squeeze_pred`, controller-effective `squeeze_target_eff` after feed-forward/override,
+controller EMA `squeeze_meas`, and unfiltered `squeeze_meas_raw`. The video plots the raw
+model target in blue, effective controller target in red, and raw measurement in orange.
+The raw measurement becomes `trajectory_mean_measured_squeeze` only after the separate
+grasp/contact/reward-valid gate. For scalar-schema-v2 captures, the exporter defaults to all
+three force series by auto-discovering `<run>/traces/<suite>_task<ID>.jsonl`; `--step-trace`
+overrides that location. It verifies the trace and capture `squeeze_pred/squeeze_meas` values
+frame by frame before using `effective_squeeze_target_n` and `reward_squeeze_meas_raw`. Export
+fails rather than silently reverting to the historical EMA curve when the matching trace is
+unavailable.
+
+Gripper semantics are independently audited. Mode-6 scalar schema v2 records raw model
+`d_pred`, final force-corrected and clamped `d_cmd`, both raw post-step finger joint positions,
+and `d_actual=mean(q_left,q_right)`. By default the video plots `d_pred` in cyan, `d_cmd` in
+green, and `d_actual` in magenta, in millimetres. The loader checks that `d_actual` equals the
+two-joint mean and rejects legacy captures that averaged the signed policy observation
+`[q_left,-q_right]`. Manifest schema v5 records these three plotted gripper series.
+
 ### `raw_data_retention_analysis.py`
 
 Counts successful demos under each HDF5 in `REPLAYED_DEMOS_DIR` and compares the count with the expected number of episodes.

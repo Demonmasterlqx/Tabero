@@ -43,6 +43,7 @@ from benchmarks.common.episode_metrics import (
     extract_object_damage_details,
     resolve_episode_termination,
     summarize_episode_force_metrics,
+    summarize_force_tracking_metrics,
     summarize_trajectory_force_metrics,
 )
 from benchmarks.common.episode_lift import EpisodeLiftTracker
@@ -651,6 +652,15 @@ def run_closed_loop_policy(  # noqa: C901
                 "prompt_adverb": (args.prompt_adverb or "").strip(),
                 "prompt_adverbs": list(args.prompt_adverbs) if args.prompt_adverbs else [],
                 "prompt_seed": int(args.prompt_seed),
+                "mode6_scalar_schema_version": 3,
+                "force_target_semantics": {
+                    "predicted": "raw_model_squeeze_target",
+                    "effective": "controller_target_after_feed_forward_or_override",
+                    "measured_ema": "controller_filtered_measured_squeeze",
+                    "measured_raw": "unfiltered_gripper_local_squeeze",
+                },
+                "gripper_command_semantics": "controller_d_cmd",
+                "gripper_measured_semantics": "mean_raw_finger_joint_position",
                 "timestamp": ts,
             }
             with open(capture_mode6_root / "run_meta.json", "w", encoding="utf-8") as f:
@@ -804,6 +814,12 @@ def run_closed_loop_policy(  # noqa: C901
             # 缓存逐步左右指实测 3D 力，用于接触步数与覆盖率统计。
             exp_fL_meas_values: list[np.ndarray] = []
             exp_fR_meas_values: list[np.ndarray] = []
+            exp_tracking_reward_valid: list[bool] = []
+            exp_tracking_squeeze_pred: list[float | None] = []
+            exp_tracking_squeeze_target_eff: list[float | None] = []
+            exp_tracking_squeeze_meas_raw: list[float | None] = []
+            exp_tracking_gripper_pred: list[float | None] = []
+            exp_tracking_gripper_cmd: list[float | None] = []
 
             # RLinf success.force_bonus-equivalent trajectory force tracking.
             trajectory_force_tracker: TrajectoryForceTracker | None = None
@@ -936,6 +952,15 @@ def run_closed_loop_policy(  # noqa: C901
                         "camera_names": list(args.camera_names),
                         "tactile_sensor_names": list(args.tactile_sensor_names),
                         "tactile_output_type_saved": "markers_rgb",
+                        "mode6_scalar_schema_version": 3,
+                        "force_target_semantics": {
+                            "predicted": "raw_model_squeeze_target",
+                            "effective": "controller_target_after_feed_forward_or_override",
+                            "measured_ema": "controller_filtered_measured_squeeze",
+                            "measured_raw": "unfiltered_gripper_local_squeeze",
+                        },
+                        "gripper_command_semantics": "controller_d_cmd",
+                        "gripper_measured_semantics": "mean_raw_finger_joint_position",
                     }
                     with open(mode6_exp_dir / "exp_meta.json", "w", encoding="utf-8") as f:
                         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -1164,6 +1189,17 @@ def run_closed_loop_policy(  # noqa: C901
                     step_effective_single_finger_target = None
                     step_effective_squeeze_target = None
                     step_target_contact_force_norm = None
+                    step_gripper_pred = None
+                    step_gripper_cmd = None
+                    step_gripper_meas = None
+                    step_gripper_closed_limit = 0.0
+                    step_gripper_open_limit = _finite_float_or_none(
+                        getattr(env.unwrapped.cfg, "gripper_open_val", 0.04)
+                    )
+                    if step_gripper_open_limit is None:
+                        step_gripper_open_limit = 0.04
+                    step_gripper_lower_saturated = None
+                    step_gripper_upper_saturated = None
                     step_reward_force = {
                         "reward_grasp_observed": None,
                         "reward_grasp_terms_active": [],
@@ -1270,6 +1306,24 @@ def run_closed_loop_policy(  # noqa: C901
                             step_effective_squeeze_target = _finite_float_or_none(
                                 debug.get("target_contact_squeeze_target")
                             )
+                            step_gripper_pred = _finite_float_or_none(
+                                debug.get("d_pred")
+                            )
+                            step_gripper_cmd = _finite_float_or_none(
+                                debug.get("d_cmd")
+                            )
+                            step_gripper_meas = _finite_float_or_none(
+                                debug.get("d_actual")
+                            )
+                            if step_gripper_cmd is not None:
+                                step_gripper_lower_saturated = bool(
+                                    step_gripper_cmd
+                                    <= step_gripper_closed_limit + 1.0e-8
+                                )
+                                step_gripper_upper_saturated = bool(
+                                    step_gripper_cmd
+                                    >= step_gripper_open_limit - 1.0e-8
+                                )
                             step_target_contact_force_norm = _finite_float_or_none(
                                 debug.get("target_contact_force_norm")
                             )
@@ -1452,6 +1506,19 @@ def run_closed_loop_policy(  # noqa: C901
                                 f"metric for experiment {exp_idx}: {exc}"
                             )
 
+                    exp_tracking_reward_valid.append(
+                        bool(step_reward_force["reward_force_valid_step"])
+                    )
+                    exp_tracking_squeeze_pred.append(step_squeeze_pred)
+                    exp_tracking_squeeze_target_eff.append(
+                        step_effective_squeeze_target
+                    )
+                    exp_tracking_squeeze_meas_raw.append(
+                        step_reward_force["reward_squeeze_meas_raw"]
+                    )
+                    exp_tracking_gripper_pred.append(step_gripper_pred)
+                    exp_tracking_gripper_cmd.append(step_gripper_cmd)
+
                     if lift_tracker is not None and lift_object is not None:
                         object_height_m = float(
                             lift_object.data.root_pos_w[0, 2]
@@ -1470,7 +1537,7 @@ def run_closed_loop_policy(  # noqa: C901
                     if args.step_trace_path is not None:
                         exp_step_trace_rows.append(
                             {
-                                "schema_version": 2,
+                                "schema_version": 3,
                                 "task_suite": args.task_suite,
                                 "task_id": int(args.task_id),
                                 "experiment_index": int(exp_idx),
@@ -1495,6 +1562,13 @@ def run_closed_loop_policy(  # noqa: C901
                                 "target_contact_force_norm": step_target_contact_force_norm,
                                 "effective_single_finger_target_n": step_effective_single_finger_target,
                                 "effective_squeeze_target_n": step_effective_squeeze_target,
+                                "gripper_pred_m": step_gripper_pred,
+                                "gripper_cmd_m": step_gripper_cmd,
+                                "gripper_meas_m": step_gripper_meas,
+                                "gripper_closed_limit_m": step_gripper_closed_limit,
+                                "gripper_open_limit_m": step_gripper_open_limit,
+                                "gripper_lower_saturated": step_gripper_lower_saturated,
+                                "gripper_upper_saturated": step_gripper_upper_saturated,
                                 **step_reward_force,
                                 **step_lift_state,
                             }
@@ -1607,38 +1681,67 @@ def run_closed_loop_policy(  # noqa: C901
                                     continue
 
                             # --- Scalars (pred/meas) ---
-                            # gripper_cmd: from executed action (1D)
-                            # gripper_meas: from obs["policy"]["gripper_pos"] (2,) -> mean (1D)
+                            # Gripper position semantics for force-position control:
+                            # - pred: raw policy d_pred before force correction/clamping
+                            # - cmd: controller-corrected and clamped d_cmd actually sent to both joints
+                            # - meas: mean of the two raw finger joint positions after env.step()
+                            # Do not average obs["policy"]["gripper_pos"] here: that observation
+                            # contains [q_left, -q_right], whose mean is a signed asymmetry rather
+                            # than a gripper opening position.
+                            gripper_pred = None
                             gripper_cmd = None
                             gripper_meas = None
+                            gripper_joint_left = None
+                            gripper_joint_right = None
 
                             # squeeze_pred: prefer ForcePositionAction.debug_info if available, else derive from 13D action forces
                             # squeeze_meas: prefer ForcePositionAction.debug_info if available, else derive from obs["policy"]["gripper_net_force"]
                             squeeze_pred = None
                             squeeze_meas = None
 
-                            # commanded gripper position from executed action (shape depends on control_mode)
+                            # Raw model prediction from the executed action. This is retained for
+                            # audit, but the video command curve uses the final controller d_cmd.
                             try:
                                 a_np = action[i].detach().cpu().numpy().astype(np.float32)
                                 # - hybrid/tactile: 13D => gripper at index 6
                                 # - diffik/osc/binary: 8D => gripper at index 7
                                 if a_np.shape[-1] >= 13:
-                                    gripper_cmd = float(a_np[6])
+                                    gripper_pred = float(a_np[6])
                                 elif a_np.shape[-1] >= 8:
-                                    gripper_cmd = float(a_np[7])
+                                    gripper_pred = float(a_np[7])
                                 elif a_np.shape[-1] >= 7:
-                                    gripper_cmd = float(a_np[6])
+                                    gripper_pred = float(a_np[6])
                             except Exception:
                                 pass
 
-                            # measured gripper position and measured squeeze from policy obs
+                            # Controller command and raw joint measurements. ForcePositionAction
+                            # exposes these values after applying the current env step.
+                            try:
+                                if debug:
+                                    debug_gripper_pred = _finite_float_or_none(
+                                        debug.get("d_pred")
+                                    )
+                                    if debug_gripper_pred is not None:
+                                        gripper_pred = debug_gripper_pred
+                                    gripper_cmd = _finite_float_or_none(
+                                        debug.get("d_cmd")
+                                    )
+                                    gripper_meas = _finite_float_or_none(
+                                        debug.get("d_actual")
+                                    )
+                                    gripper_joint_left = _finite_float_or_none(
+                                        debug.get("d_actual_left")
+                                    )
+                                    gripper_joint_right = _finite_float_or_none(
+                                        debug.get("d_actual_right")
+                                    )
+                            except Exception:
+                                pass
+
+                            # Measured squeeze from policy obs; gripper position intentionally
+                            # does not use the signed gripper_pos observation.
                             try:
                                 policy_obs = obs.get("policy", {}) if isinstance(obs, dict) else {}
-                                gp = policy_obs.get("gripper_pos", None)
-                                if gp is not None:
-                                    gp0 = gp[0].detach().cpu().numpy().astype(np.float32).reshape(-1)
-                                    if gp0.size > 0:
-                                        gripper_meas = float(np.mean(gp0))
                                 gnf = policy_obs.get("gripper_net_force", None)
                                 if gnf is not None:
                                     f_lr = gnf[0, 0].detach().cpu().numpy().astype(np.float32)  # (2,3)
@@ -1681,10 +1784,20 @@ def run_closed_loop_policy(  # noqa: C901
                                 "action_idx": int(action_idx),
                                 "replan_i": int(i),
                                 "frame": int(frame_count),
+                                "mode6_scalar_schema_version": 3,
+                                "gripper_pred": gripper_pred,
                                 "gripper_cmd": gripper_cmd,
                                 "gripper_meas": gripper_meas,
+                                "gripper_joint_left": gripper_joint_left,
+                                "gripper_joint_right": gripper_joint_right,
                                 "squeeze_pred": squeeze_pred,
+                                "squeeze_target_eff": step_effective_squeeze_target,
                                 "squeeze_meas": squeeze_meas,
+                                "squeeze_meas_raw": step_reward_force[
+                                    "reward_squeeze_meas_raw"
+                                ],
+                                "gripper_lower_saturated": step_gripper_lower_saturated,
+                                "gripper_upper_saturated": step_gripper_upper_saturated,
                             }
                             mode6_force_fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
                         except Exception:
@@ -1776,6 +1889,30 @@ def run_closed_loop_policy(  # noqa: C901
                 trajectory_force_summary["trajectory_force_error"] = (
                     trajectory_force_error
                 )
+
+            try:
+                force_tracking_summary = summarize_force_tracking_metrics(
+                    expected_steps=total_steps_taken,
+                    reward_valid_steps=exp_tracking_reward_valid,
+                    predicted_squeeze_values=exp_tracking_squeeze_pred,
+                    effective_squeeze_target_values=(
+                        exp_tracking_squeeze_target_eff
+                    ),
+                    measured_squeeze_raw_values=(
+                        exp_tracking_squeeze_meas_raw
+                    ),
+                    gripper_pred_values=exp_tracking_gripper_pred,
+                    gripper_cmd_values=exp_tracking_gripper_cmd,
+                    gripper_closed_limit_m=0.0,
+                    gripper_open_limit_m=float(
+                        getattr(env.unwrapped.cfg, "gripper_open_val", 0.04)
+                    ),
+                )
+            except Exception as exc:
+                force_tracking_summary = {
+                    "status": "error",
+                    "error": str(exc),
+                }
 
             def _mean_or_none(values: list[float]) -> float | None:
                 return float(np.mean(values)) if values else None
@@ -1874,6 +2011,7 @@ def run_closed_loop_policy(  # noqa: C901
                 "inference_chunks": int(inference_chunks_taken),
                 **force_summary,
                 **trajectory_force_summary,
+                "force_tracking": force_tracking_summary,
                 "force_override": force_override_summary,
                 "lift": lift_summary,
                 "video": video_summary,

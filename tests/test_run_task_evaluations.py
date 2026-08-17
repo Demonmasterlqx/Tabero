@@ -49,6 +49,44 @@ def _episode_record(index: int, *, success: bool, env_steps: int, chunks: int) -
         "trajectory_force_error": None,
         "grasp_started": True,
         "grasp_start_step": 1,
+        "force_tracking": {
+            "status": "complete",
+            "semantics": {
+                "population": "reward_force_valid_step",
+                "predicted": "raw_model_squeeze_target",
+                "effective_target": "controller_target_after_feed_forward_or_override",
+                "measured": "raw_unfiltered_gripper_local_squeeze",
+            },
+            "sample_counts": {
+                "env_steps": env_steps,
+                "available_steps": env_steps,
+                "unavailable_steps": 0,
+                "reward_valid_steps": 4,
+                "reward_valid_available_steps": 4,
+            },
+            "reward_valid": {
+                "mean_predicted_squeeze_n": 1.0,
+                "mean_effective_squeeze_target_n": 1.9,
+                "mean_measured_squeeze_raw_n": 2.0,
+                "mean_model_target_error_n": -1.0,
+                "mean_effective_target_error_n": -0.1,
+                "effective_target_mae_n": 0.1,
+                "effective_target_rmse_n": 0.1,
+            },
+            "gripper_position_command": {
+                "closed_limit_m": 0.0,
+                "open_limit_m": 0.04,
+                "saturation_epsilon_m": 1e-8,
+                "lower_saturation_steps": 4,
+                "upper_saturation_steps": 0,
+                "lower_saturation_ratio": 4 / env_steps,
+                "upper_saturation_ratio": 0.0,
+                "reward_valid_lower_saturation_steps": 4,
+                "reward_valid_upper_saturation_steps": 0,
+                "reward_valid_lower_saturation_ratio": 1.0,
+                "reward_valid_upper_saturation_ratio": 0.0,
+            },
+        },
         "trace_status": "disabled",
         "trace_rows": 0,
         "trace_error": None,
@@ -557,7 +595,7 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
     rte.save_success_rates_txt([result], txt_path, config)
 
     json_result = json.loads(json_path.read_text())
-    assert json_result["metadata"]["episode_metrics_schema_version"] == 4
+    assert json_result["metadata"]["episode_metrics_schema_version"] == 5
     assert json_result["metadata"]["reward_force_contact_epsilon_n"] == 1.0
     assert json_result["metadata"]["reward_force_min_valid_samples"] == 4
     task = json_result["results"]["libero_object_task1"]
@@ -578,6 +616,7 @@ def test_json_and_txt_include_episode_metrics_and_na(tmp_path):
     assert "cream_cheese_1 | mass_friction | 0.2000" in text
     assert "cream_cheese_1 | 0.5000 | 0.5000" in text
     assert "Per-experiment force metrics:" in text
+    assert "Per-experiment force-target tracking:" in text
     assert "Reward-aligned trajectory force:" in text
     assert "Per-experiment reward-aligned trajectory force:" in text
     assert task["success_trajectory_force_episode_count"] == 0

@@ -18,6 +18,7 @@ from benchmarks.common.episode_metrics import (
     extract_object_damage_details,
     resolve_episode_termination,
     summarize_episode_force_metrics,
+    summarize_force_tracking_metrics,
     summarize_damage_threshold_statistics,
     summarize_friction_statistics,
     summarize_step_statistics,
@@ -162,6 +163,76 @@ def test_trajectory_force_aggregation_is_success_and_eligibility_aware():
     assert summary["trajectory_force_valid_sample_statistics"]["successful"][
         "median"
     ] == pytest.approx(3.5)
+
+
+def test_force_tracking_uses_reward_valid_population_and_counts_saturation():
+    summary = summarize_force_tracking_metrics(
+        expected_steps=4,
+        reward_valid_steps=[False, True, True, True],
+        predicted_squeeze_values=[1.0, 80.0, 90.0, 100.0],
+        effective_squeeze_target_values=[1.0, 152.0, 171.0, 190.0],
+        measured_squeeze_raw_values=[0.0, 30.0, 40.0, 50.0],
+        gripper_pred_values=[0.04, 0.02, 0.02, 0.02],
+        gripper_cmd_values=[0.04, 0.0, 0.0, 0.01],
+        gripper_closed_limit_m=0.0,
+        gripper_open_limit_m=0.04,
+    )
+
+    assert summary["status"] == "complete"
+    assert summary["sample_counts"] == {
+        "env_steps": 4,
+        "available_steps": 4,
+        "unavailable_steps": 0,
+        "reward_valid_steps": 3,
+        "reward_valid_available_steps": 3,
+    }
+    assert summary["reward_valid"]["mean_predicted_squeeze_n"] == pytest.approx(
+        90.0
+    )
+    assert summary["reward_valid"][
+        "mean_effective_squeeze_target_n"
+    ] == pytest.approx(171.0)
+    assert summary["reward_valid"][
+        "mean_measured_squeeze_raw_n"
+    ] == pytest.approx(40.0)
+    assert summary["reward_valid"][
+        "mean_effective_target_error_n"
+    ] == pytest.approx(131.0)
+    command = summary["gripper_position_command"]
+    assert command["lower_saturation_steps"] == 2
+    assert command["upper_saturation_steps"] == 1
+    assert command["reward_valid_lower_saturation_steps"] == 2
+    assert command["reward_valid_lower_saturation_ratio"] == pytest.approx(2 / 3)
+
+
+def test_force_tracking_marks_missing_scalars_partial_and_rejects_misalignment():
+    summary = summarize_force_tracking_metrics(
+        expected_steps=2,
+        reward_valid_steps=[False, True],
+        predicted_squeeze_values=[1.0, 2.0],
+        effective_squeeze_target_values=[1.0, None],
+        measured_squeeze_raw_values=[0.0, 1.0],
+        gripper_pred_values=[0.04, 0.02],
+        gripper_cmd_values=[0.04, 0.01],
+        gripper_closed_limit_m=0.0,
+        gripper_open_limit_m=0.04,
+    )
+    assert summary["status"] == "partial"
+    assert summary["sample_counts"]["available_steps"] == 1
+    assert summary["sample_counts"]["reward_valid_available_steps"] == 0
+
+    with pytest.raises(ValueError, match="must match expected_steps"):
+        summarize_force_tracking_metrics(
+            expected_steps=2,
+            reward_valid_steps=[True],
+            predicted_squeeze_values=[1.0, 2.0],
+            effective_squeeze_target_values=[1.0, 2.0],
+            measured_squeeze_raw_values=[1.0, 2.0],
+            gripper_pred_values=[0.01, 0.01],
+            gripper_cmd_values=[0.0, 0.0],
+            gripper_closed_limit_m=0.0,
+            gripper_open_limit_m=0.04,
+        )
 
 
 def test_extract_friction_snapshot_is_json_safe():

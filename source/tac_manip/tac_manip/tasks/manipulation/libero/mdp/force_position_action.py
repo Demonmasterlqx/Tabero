@@ -565,6 +565,7 @@ class ForcePositionAction(ActionTerm):
             d_meas = d_meas_two.mean(dim=-1)  # (N,)
         except Exception:
             d_meas = self._last_d_cmd.detach().clone()
+            d_meas_two = torch.stack([d_meas, d_meas], dim=-1)
 
         self._debug = {
             "fL_pred_local": self._fL_target_local.detach().clone(),
@@ -613,6 +614,10 @@ class ForcePositionAction(ActionTerm):
             "d_pred": d_pred.detach().clone(),
             # 保持字段名兼容 force_position_debug_viz.py：d_actual 现在是“实测关节位置”
             "d_actual": d_meas.detach().clone(),
+            # 保留左右原始关节位置，避免把带符号变换的 policy observation
+            # 误当成夹爪行程；两者的均值严格等于 d_actual。
+            "d_actual_left": d_meas_two[:, 0].detach().clone(),
+            "d_actual_right": d_meas_two[:, 1].detach().clone(),
             # 额外提供控制器下发的目标开合度，便于对比
             "d_cmd": self._last_d_cmd.detach().clone(),
             "eef_pos_pred": self._eef_pos_cmd.detach().clone(),

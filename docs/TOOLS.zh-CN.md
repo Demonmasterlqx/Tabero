@@ -294,6 +294,54 @@ JSON 保留已有 task 级力字段，并新增 `metrics_status`、`metrics_warn
 
 ---
 
+### `export_mode6_five_panel_video.py`（mode-6 五画面视频导出）
+
+将已有 OpenPI `debug_mode=6` experiment 采集数据离线拼成一个五画面视频：
+
+1. agentview；
+2. eye-in-hand；
+3. 左侧 GelSight `markers_rgb`；
+4. 右侧 GelSight `markers_rgb`；
+5. 上下排列、随时间逐帧展开的模型原始 squeeze 目标 / 控制器有效目标 / 实测 squeeze，
+   以及模型原始 `d_pred` / 最终控制器 `d_cmd` / 实测 `d_actual` 曲线。
+
+这是纯离线后处理：不会启动 Isaac 或策略 server，也不会改写原评测。四路 PNG
+和 `forces.jsonl` 必须具有从 0 开始、连续且完全一致的帧索引。成功 episode 的 debug
+帧数可能比 `env_steps` 少 1；导出器保留真实采集边界，不伪造 terminal 帧。
+
+```bash
+python scripts/tools/export_mode6_five_panel_video.py \
+  --capture-exp-dir /path/to/capture_mode6/libero_object/task_0/none/<timestamp>/exp_000 \
+  --step-trace /path/to/traces/libero_object_task0.jsonl \
+  --output /path/to/combined_5view_force_gripper_curve.mp4 \
+  --fps 20 \
+  --width 1920 \
+  --height 1080
+```
+
+输出默认为 1920×1080、20 FPS、H.264/YUV420P。工具会用 FFprobe 审计 codec、像素格式、
+分辨率、帧率和帧数，并默认写出 `combined_5view_force_curve.manifest.json`。若视频或
+manifest 已存在，需要显式传入 `--overwrite` 才会覆盖。
+
+力语义必须区分：mode-6 scalar schema v3 分别记录模型原始 `squeeze_pred`、经过前馈或
+override 后的控制器有效目标 `squeeze_target_eff`、控制器 EMA `squeeze_meas`，以及未滤波
+实测值 `squeeze_meas_raw`。视频用蓝线画模型原始目标、红线画控制器有效目标、橙线画 raw
+实测力。raw 实测值还必须经过 grasp/contact/reward-valid gate 后，才会进入
+`trajectory_mean_measured_squeeze`。对于 scalar schema v2 的旧采集，导出器默认自动查找
+`<run>/traces/<suite>_task<ID>.jsonl`，补齐控制器有效目标与 raw 实测值；非标准目录可用
+`--step-trace` 显式指定。使用前会逐帧核对 trace 与 capture 的
+`squeeze_pred/squeeze_meas`，再读取 `effective_squeeze_target_n` 和
+`reward_squeeze_meas_raw`。找不到匹配 trace 时会失败，不会静默退回旧的 EMA 两曲线。
+
+夹爪语义单独审计。mode-6 scalar schema v2 同时保存模型原始 `d_pred`、经过力反馈修正并
+截断后的最终 `d_cmd`、左右指 post-step 原始关节位置，以及
+`d_actual=mean(q_left,q_right)`。视频默认用青线画 `d_pred`、绿线画 `d_cmd`、紫线画
+`d_actual`，单位为 mm。loader 会验证 `d_actual` 与左右关节均值一致，并拒绝把带符号
+policy observation `[q_left,-q_right]` 求平均所得的旧 capture。manifest schema v5 明确
+记录这三条已绘制的夹爪曲线。
+
+---
+
 ### `raw_data_retention_analysis.py`（“成功数据留存率”统计）
 
 - **作用**：统计 `REPLAYED_DEMOS_DIR` 下每个 HDF5 里成功 demo 的数量（以 `/data/demo_*` 计），并与期望值对比。

@@ -620,6 +620,37 @@ def collect_episode_metric_artifacts(
                     f"{episode.get('trajectory_force_status')!r}, valid_samples="
                     f"{episode.get('trajectory_force_valid_samples')!r}"
                 )
+            tracking = episode.get("force_tracking")
+            if not isinstance(tracking, dict) or tracking.get("status") != "complete":
+                metrics_warnings.append(
+                    "episode "
+                    f"{episode.get('experiment_index')} has force_tracking status="
+                    f"{tracking.get('status') if isinstance(tracking, dict) else None!r}"
+                )
+                continue
+            reward_valid_tracking = tracking.get("reward_valid", {})
+            tracking_measured = reward_valid_tracking.get(
+                "mean_measured_squeeze_raw_n"
+            )
+            trajectory_measured = episode.get(
+                "trajectory_mean_measured_squeeze"
+            )
+            if trajectory_measured is not None and (
+                not isinstance(tracking_measured, (int, float))
+                or isinstance(tracking_measured, bool)
+                or not math.isclose(
+                    float(tracking_measured),
+                    float(trajectory_measured),
+                    rel_tol=1.0e-7,
+                    abs_tol=1.0e-7,
+                )
+            ):
+                metrics_warnings.append(
+                    "episode "
+                    f"{episode.get('experiment_index')} force_tracking measured mean="
+                    f"{tracking_measured!r} does not match trajectory metric="
+                    f"{trajectory_measured!r}"
+                )
 
     if config.record_step_traces:
         for episode in episodes:
@@ -958,7 +989,7 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
             "task_environment": config.task if config.task else "auto",
             "num_total_experiments": config.num_total_experiments,
             "num_success_steps": config.num_success_steps,
-            "episode_metrics_schema_version": 4,
+            "episode_metrics_schema_version": 5,
             "replan_steps": config.replan_steps,
             "lift_height_threshold_m": config.lift_height_threshold_m,
             "lift_hold_steps": config.lift_hold_steps,
@@ -1338,6 +1369,46 @@ def _write_episode_metrics_txt(output, result: dict) -> None:
             + " | ".join(
                 [_txt_value(episode.get("experiment_index"))]
                 + [_txt_value(episode.get(key)) for key in FORCE_METRIC_KEYS]
+            )
+            + "\n"
+        )
+
+    output.write("    Per-experiment force-target tracking:\n")
+    output.write(
+        "      exp | status | valid | model_raw_mean | effective_target_mean | "
+        "measured_raw_mean | effective_error_mean | lower_sat_valid | lower_sat_valid_ratio\n"
+    )
+    if not episodes:
+        output.write("      N/A\n")
+    for episode in episodes:
+        tracking = episode.get("force_tracking") or {}
+        samples = tracking.get("sample_counts") or {}
+        reward_valid = tracking.get("reward_valid") or {}
+        command = tracking.get("gripper_position_command") or {}
+        output.write(
+            "      "
+            + " | ".join(
+                [
+                    _txt_value(episode.get("experiment_index")),
+                    _txt_value(tracking.get("status")),
+                    _txt_value(samples.get("reward_valid_available_steps")),
+                    _txt_value(reward_valid.get("mean_predicted_squeeze_n")),
+                    _txt_value(
+                        reward_valid.get("mean_effective_squeeze_target_n")
+                    ),
+                    _txt_value(
+                        reward_valid.get("mean_measured_squeeze_raw_n")
+                    ),
+                    _txt_value(
+                        reward_valid.get("mean_effective_target_error_n")
+                    ),
+                    _txt_value(
+                        command.get("reward_valid_lower_saturation_steps")
+                    ),
+                    _txt_value(
+                        command.get("reward_valid_lower_saturation_ratio")
+                    ),
+                ]
             )
             + "\n"
         )
