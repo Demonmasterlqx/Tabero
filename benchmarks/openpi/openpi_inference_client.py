@@ -20,6 +20,9 @@ from typing import Optional
 project_root = Path(__file__).parent.parent.parent.resolve()
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+# Prefer this checkout's controller and evaluation diagnostics over an editable
+# tac_manip installation pointing at another checkout in the conda environment.
+sys.path.insert(0, str(project_root / "source" / "tac_manip"))
 
 import cv2
 import numpy as np
@@ -51,6 +54,7 @@ from benchmarks.common.episode_video import EpisodeVideoWriter
 from benchmarks.common.metrics import (
     compute_contact_force_series_from_lr_forces,
     compute_topk_mean,
+    grip_force_metric_metadata,
 )
 from benchmarks.openpi.openpi_payload import infer_openpi_step
 
@@ -301,6 +305,7 @@ class _OnlineTactileBuffer:
 @dataclass
 class OpenpiClientArguments(ClosedLoopArguments):
 
+    old_eval: bool = False
     record_images: bool = False
     record_videos: bool = False
     num_envs: int = 1
@@ -601,6 +606,8 @@ def run_closed_loop_policy(  # noqa: C901
     success_term: Callable[[gym.Env], bool] | None,
 ):
     """Run the closed loop policy evaluation."""
+    grip_metadata = grip_force_metric_metadata(args.old_eval)
+    print("[Grip-Force-Eval] " + json.dumps(grip_metadata))
     if (
         not np.isfinite(args.reward_force_contact_epsilon_n)
         or args.reward_force_contact_epsilon_n < 0.0
@@ -674,6 +681,7 @@ def run_closed_loop_policy(  # noqa: C901
                 "prompt_adverbs": list(args.prompt_adverbs) if args.prompt_adverbs else [],
                 "prompt_seed": int(args.prompt_seed),
                 "mode6_scalar_schema_version": 3,
+                **grip_metadata,
                 "force_target_semantics": {
                     "predicted": "raw_model_squeeze_target",
                     "effective": "controller_target_after_feed_forward_or_override",
@@ -980,6 +988,7 @@ def run_closed_loop_policy(  # noqa: C901
                         "tactile_sensor_names": list(args.tactile_sensor_names),
                         "tactile_output_type_saved": "markers_rgb",
                         "mode6_scalar_schema_version": 3,
+                        **grip_metadata,
                         "force_target_semantics": {
                             "predicted": "raw_model_squeeze_target",
                             "effective": "controller_target_after_feed_forward_or_override",
@@ -1203,6 +1212,8 @@ def run_closed_loop_policy(  # noqa: C901
                     step_fR_meas_raw = None
                     step_squeeze_pred = None
                     step_squeeze_meas = None
+                    step_grip_eval_pred = None
+                    step_grip_eval_meas = None
                     step_ap_pred = None
                     step_ap_meas = None
                     step_override_enabled = False
@@ -1265,12 +1276,18 @@ def run_closed_loop_policy(  # noqa: C901
                         try:
                             if debug.get("f_sq_pred") is not None:
                                 step_squeeze_pred = _finite_float_or_none(debug["f_sq_pred"])
-                                if step_squeeze_pred is not None:
-                                    exp_fsq_pred_values.append(step_squeeze_pred)
+                                step_grip_eval_pred = _finite_float_or_none(
+                                    debug.get("f_sq_pred" if args.old_eval else "f_grip_mean_pred")
+                                )
+                                if step_grip_eval_pred is not None:
+                                    exp_fsq_pred_values.append(step_grip_eval_pred)
                             if debug.get("f_sq_meas") is not None:
                                 step_squeeze_meas = _finite_float_or_none(debug["f_sq_meas"])
-                                if step_squeeze_meas is not None:
-                                    exp_fsq_meas_values.append(step_squeeze_meas)
+                                step_grip_eval_meas = _finite_float_or_none(
+                                    debug.get("f_sq_meas" if args.old_eval else "f_grip_mean_meas")
+                                )
+                                if step_grip_eval_meas is not None:
+                                    exp_fsq_meas_values.append(step_grip_eval_meas)
 
                             # 加持力模长（在 base frame 下），用于 Ap 相关统计
                             ap_pred = debug.get("F_app_norm_pred", None)
@@ -1412,14 +1429,21 @@ def run_closed_loop_policy(  # noqa: C901
                             )
                             squeeze_meas = _finite_float_or_none(series.squeeze[0])
                             ap_meas = _finite_float_or_none(series.external_norm[0])
+                            eval_series = compute_contact_force_series_from_lr_forces(
+                                fL=np.asarray([f_left], dtype=np.float32),
+                                fR=np.asarray([f_right], dtype=np.float32),
+                                old_eval=args.old_eval,
+                            )
+                            step_grip_eval_meas = _finite_float_or_none(eval_series.squeeze[0])
+                            step_grip_eval_pred = 0.0
 
                             # pred placeholders (0.0) for log/regex compatibility
                             squeeze_pred = 0.0
                             ap_pred = 0.0
 
                             exp_fsq_pred_values.append(squeeze_pred)
-                            if squeeze_meas is not None:
-                                exp_fsq_meas_values.append(squeeze_meas)
+                            if step_grip_eval_meas is not None:
+                                exp_fsq_meas_values.append(step_grip_eval_meas)
 
                             exp_ap_pred_values.append(ap_pred)
                             if ap_meas is not None:
@@ -1574,6 +1598,9 @@ def run_closed_loop_policy(  # noqa: C901
                                 "fR_meas_local": step_fR_meas,
                                 "squeeze_pred": step_squeeze_pred,
                                 "squeeze_meas": step_squeeze_meas,
+                                "old_eval": args.old_eval,
+                                "grip_force_eval_pred": step_grip_eval_pred,
+                                "grip_force_eval_meas": step_grip_eval_meas,
                                 "ap_pred": step_ap_pred,
                                 "ap_meas": step_ap_meas,
                                 "predicted_contact": _contact_or_none(step_fL_pred, step_fR_pred),
@@ -1814,6 +1841,9 @@ def run_closed_loop_policy(  # noqa: C901
                                 "gripper_joint_left": gripper_joint_left,
                                 "gripper_joint_right": gripper_joint_right,
                                 "squeeze_pred": squeeze_pred,
+                                "old_eval": args.old_eval,
+                                "grip_force_eval_pred": step_grip_eval_pred,
+                                "grip_force_eval_meas": step_grip_eval_meas,
                                 "squeeze_target_eff": step_effective_squeeze_target,
                                 "squeeze_meas": squeeze_meas,
                                 "squeeze_meas_raw": step_reward_force[
@@ -1888,6 +1918,7 @@ def run_closed_loop_policy(  # noqa: C901
             force_summary = summarize_episode_force_metrics(
                 force_mode=force_mode,
                 env_steps=total_steps_taken,
+                old_eval=args.old_eval,
                 actions_13d=exp_actions_13d,
                 squeeze_pred_values=exp_fsq_pred_values,
                 squeeze_meas_values=exp_fsq_meas_values,
@@ -2022,6 +2053,7 @@ def run_closed_loop_policy(  # noqa: C901
                         print(f"[Step-Trace] Failed while writing experiment {exp_idx}: {exc}")
 
             episode_record = {
+                **grip_metadata,
                 "experiment_index": int(exp_idx),
                 "hdf5_episode_index": dataset_episode_index,
                 "success": bool(experiment_success),
@@ -2049,6 +2081,7 @@ def run_closed_loop_policy(  # noqa: C901
             if force_dump_dir is not None:
                 try:
                     payload = {
+                        **grip_metadata,
                         "task_suite": args.task_suite,
                         "task_id": int(args.task_id),
                         "exp_idx": int(exp_idx),

@@ -17,9 +17,15 @@ from isaaclab.app import AppLauncher
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+# Use this checkout's controller diagnostics even if conda has another checkout installed.
+sys.path.insert(0, str(_PROJECT_ROOT / "source" / "tac_manip"))
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay demonstrations in Isaac Lab environments.")
+parser.add_argument(
+    "--old_eval", "--old-eval", action="store_true",
+    help="Use legacy 2*min finger force for grip-force evaluation metrics.",
+)
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to replay episodes.")
 parser.add_argument("--task", type=str, default=None, help="Force to use the specified task.")
 parser.add_argument(
@@ -276,7 +282,11 @@ import gymnasium as gym
 import torch
 from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg
 from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
-from benchmarks.common.metrics import compute_contact_force_metrics_from_13d, compute_topk_mean
+from benchmarks.common.metrics import (
+    compute_contact_force_metrics_from_13d,
+    compute_topk_mean,
+    grip_force_metric_metadata,
+)
 
 if args_cli.enable_pinocchio:
     import isaaclab_tasks.manager_based.manipulation.pick_place  # noqa: F401
@@ -306,6 +316,7 @@ def pause_cb():
 
 def main():  # noqa: C901
     """Replay episodes loaded from a file."""
+    print(f"[Grip-Force-Eval] {grip_force_metric_metadata(args_cli.old_eval)}")
     global is_paused
 
     # Load dataset
@@ -415,8 +426,8 @@ def main():  # noqa: C901
         nonlocal fsq_pred_sum, fsq_meas_sum, fsq_count, fsq_meas_values, ap_pred_values, ap_meas_values
         if not debug:
             return
-        f_pred = debug.get("f_sq_pred", None)
-        f_meas = debug.get("f_sq_meas", None)
+        f_pred = debug.get("f_sq_pred" if args_cli.old_eval else "f_grip_mean_pred")
+        f_meas = debug.get("f_sq_meas" if args_cli.old_eval else "f_grip_mean_meas")
         if f_pred is None or f_meas is None:
             return
         try:
@@ -577,7 +588,9 @@ def main():  # noqa: C901
                                             and episode_actions.ndim == 2
                                             and episode_actions.shape[1] == 13
                                         ):
-                                            metrics = compute_contact_force_metrics_from_13d(episode_actions)
+                                            metrics = compute_contact_force_metrics_from_13d(
+                                                episode_actions, old_eval=args_cli.old_eval
+                                            )
                                             succ_metrics_count += 1
                                             succ_squeeze_max_sum += metrics.squeeze_max
                                             succ_squeeze_mean_sum += metrics.squeeze_mean
