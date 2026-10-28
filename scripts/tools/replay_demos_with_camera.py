@@ -662,8 +662,8 @@ def main():  # noqa: C901
         nonlocal fsq_pred_sum, fsq_meas_sum, fsq_count
         if not debug:
             return
-        f_pred = debug.get("f_sq_pred" if args_cli.old_eval else "f_grip_mean_pred")
-        f_meas = debug.get("f_sq_meas" if args_cli.old_eval else "f_grip_mean_meas")
+        f_pred = debug.get("f_sq_pred" if args_cli.old_eval else "f_grip_sum_pred")
+        f_meas = debug.get("f_sq_meas" if args_cli.old_eval else "f_grip_sum_meas")
         if f_pred is None or f_meas is None:
             return
         try:

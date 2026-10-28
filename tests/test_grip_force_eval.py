@@ -53,20 +53,20 @@ def test_evaluation_entrypoints_resolve_controller_from_this_checkout(path, monk
     )
 
 
-def test_mean_normal_force_handles_asymmetry_signs_and_zero_without_changing_applied_force():
+def test_sum_normal_force_handles_asymmetry_signs_and_zero_without_changing_applied_force():
     left = np.array([[0, 0, 2], [0, 0, -10], [0, 0, 0], [0, 0, 0], [100, 0, 2]], dtype=float)
     right = np.array([[0, 0, -10], [0, 0, -10], [0, 0, 8], [0, 0, 0], [0, 100, 10]], dtype=float)
     old = compute_contact_force_series_from_lr_forces(left, right, old_eval=True)
     new = compute_contact_force_series_from_lr_forces(left, right, old_eval=False)
     np.testing.assert_array_equal(old.squeeze, [4, 20, 0, 0, 4])
-    np.testing.assert_array_equal(new.squeeze, [6, 10, 4, 0, 6])
+    np.testing.assert_array_equal(new.squeeze, [12, 20, 8, 0, 12])
     np.testing.assert_array_equal(new.external, old.external)
     np.testing.assert_array_equal(new.contact_mask, old.contact_mask)
     # Existing non-evaluation callers keep their historical default.
     np.testing.assert_array_equal(compute_contact_force_series_from_lr_forces(left, right).squeeze, old.squeeze)
 
 
-@pytest.mark.parametrize("old_eval,top5", [(False, 25.0), (True, 40.0)])
+@pytest.mark.parametrize("old_eval,top5", [(False, 50.0), (True, 40.0)])
 def test_episode_and_success_aggregation_preserve_population_and_top5(old_eval, top5):
     # Two zero frames, 38 (2,10) frames and two distinct high-force frames.
     # Top 5% of 40 positive frames includes both high frames, not just the max.
@@ -75,7 +75,7 @@ def test_episode_and_success_aggregation_preserve_population_and_top5(old_eval, 
     actions[2:40, 12] = -10
     actions[40:, 9] = [10, 30]
     actions[40:, 12] = [-30, -30]
-    grip = np.array([0, 0] + ([4] * 38 + [20, 60] if old_eval else [6] * 38 + [20, 30]))
+    grip = np.array([0, 0] + ([4] * 38 + [20, 60] if old_eval else [12] * 38 + [40, 60]))
     summary = summarize_episode_force_metrics(
         force_mode="full", env_steps=42, old_eval=old_eval,
         actions_13d=actions, squeeze_pred_values=grip, squeeze_meas_values=grip,
@@ -83,7 +83,7 @@ def test_episode_and_success_aggregation_preserve_population_and_top5(old_eval, 
         fL_meas_values=actions[:, 7:10], fR_meas_values=actions[:, 10:13],
     )
     # All-frame averages retain the two zero-force frames.
-    expected_mean = (232 if old_eval else 278) / 42
+    expected_mean = (232 if old_eval else 556) / 42
     assert summary["squeeze_avg_pred"] == pytest.approx(expected_mean)
     assert summary["squeeze_avg_meas"] == pytest.approx(expected_mean)
     assert summary["squeeze_max_pred"] == pytest.approx(top5)
@@ -92,7 +92,7 @@ def test_episode_and_success_aggregation_preserve_population_and_top5(old_eval, 
     assert summary["force_samples"]["predicted_contact_steps"] == 40
     # Shared helper means use contact frames; evaluator AG uses the whole episode.
     contact = compute_contact_force_metrics_from_13d(actions, old_eval=old_eval)
-    assert contact.squeeze_mean == pytest.approx((232 if old_eval else 278) / 40)
+    assert contact.squeeze_mean == pytest.approx((232 if old_eval else 556) / 40)
     aggregates, counts = aggregate_success_force_metrics([
         {**summary, "success": True},
         {"success": True, "squeeze_avg_pred": 0.0},
@@ -103,7 +103,7 @@ def test_episode_and_success_aggregation_preserve_population_and_top5(old_eval, 
     assert counts["squeeze_avg_meas"] == 1
 
 
-@pytest.mark.parametrize("old_eval,grip,peak", [(False, [0, 6, 10], 10), (True, [0, 4, 20], 20)])
+@pytest.mark.parametrize("old_eval,grip,peak", [(False, [0, 12, 20], 20), (True, [0, 4, 20], 20)])
 def test_binary_mode_keeps_measured_only_compatibility_slots(old_eval, grip, peak):
     summary = summarize_episode_force_metrics(
         force_mode="measured_only", env_steps=3, old_eval=old_eval,
@@ -158,7 +158,7 @@ def _cpu_controller(alpha):
     controller._fL_target_local = torch.tensor([[0.0, 0.0, 2.0]])
     controller._fR_target_local = torch.tensor([[0.0, 0.0, -10.0]])
     controller._f_sq_meas_ema = torch.zeros(1)
-    controller._f_grip_mean_meas_ema = torch.zeros(1)
+    controller._f_grip_sum_meas_ema = torch.zeros(1)
     controller._f_sq_meas_ema_initialized = False
     controller._left_frame = SimpleNamespace(data=SimpleNamespace(target_quat_w=torch.zeros(1, 1, 4)))
     controller._robot = SimpleNamespace(
@@ -183,7 +183,7 @@ def _cpu_controller(alpha):
     return controller
 
 
-@pytest.mark.parametrize("alpha,expected_old,expected_new", [(0.2, 5.76, 6.24), (1.0, 0.0, 0.0)])
+@pytest.mark.parametrize("alpha,expected_old,expected_new", [(0.2, 5.76, 12.48), (1.0, 0.0, 0.0)])
 def test_production_controller_ema_uses_every_physics_step_and_preserves_commands(alpha, expected_old, expected_new):
     controller = _cpu_controller(alpha)
     # Three physics substeps in one control step: samples must not be collapsed
@@ -192,17 +192,17 @@ def test_production_controller_ema_uses_every_physics_step_and_preserves_command
         controller._env.force = torch.tensor([[[[0.0, 0.0, left], [0.0, 0.0, right]]]])
         controller.apply_actions()
     debug = controller._debug
-    assert debug["f_grip_mean_pred"].item() == pytest.approx(6)
+    assert debug["f_grip_sum_pred"].item() == pytest.approx(12)
     assert debug["f_sq_pred"].item() == pytest.approx(4)
     assert debug["f_sq_meas"].item() == pytest.approx(expected_old)
-    assert debug["f_grip_mean_meas"].item() == pytest.approx(expected_new)
+    assert debug["f_grip_sum_meas"].item() == pytest.approx(expected_new)
     # Control still uses the old squeeze error, even when new evaluation is read.
     assert debug["d_cmd"].item() == pytest.approx(0.02 - 0.001 * 0.5 * (4 - expected_old))
     controller.reset()
     controller._env.force = torch.tensor([[[[0.0, 0.0, 1.0], [0.0, 0.0, -9.0]]]])
     controller.apply_actions()
     assert controller._debug["f_sq_meas"].item() == pytest.approx(2)
-    assert controller._debug["f_grip_mean_meas"].item() == pytest.approx(5)
+    assert controller._debug["f_grip_sum_meas"].item() == pytest.approx(10)
 
 
 def _client_arguments():
@@ -273,6 +273,9 @@ def test_data_evaluator_passes_flag_to_replay_subprocess(old_eval, monkeypatch, 
 @pytest.mark.parametrize("old_eval", [False, True])
 def test_policy_and_replay_outputs_record_metric_convention(old_eval, tmp_path):
     metadata = grip_force_metric_metadata(old_eval)
+    assert metadata["grip_force_definition"] == (
+        "2 * min(abs(fL_z), abs(fR_z))" if old_eval else "abs(fL_z) + abs(fR_z)"
+    )
     result = dict(task_suite="libero_object", task_id=0, task_name="task", language_instruction="pick up",
                   success_rate=100.0, successful_experiments=1, total_experiments=1,
                   execution_time=0.1, status="completed")

@@ -45,7 +45,7 @@ def grip_force_metric_metadata(old_eval: bool) -> dict[str, bool | str]:
         "grip_force_definition": (
             "2 * min(abs(fL_z), abs(fR_z))"
             if old_eval
-            else "(abs(fL_z) + abs(fR_z)) / 2"
+            else "abs(fL_z) + abs(fR_z)"
         ),
         "grip_force_unit": "N",
     }
@@ -157,7 +157,7 @@ def compute_contact_force_series_from_lr_forces(
         fL: 左指力，shape: (T, 3) 或可转换为该形状的 array-like。
         fR: 右指力，shape: (T, 3) 或可转换为该形状的 array-like。
         contact_eps: 接触阈值，当 `||fL|| + ||fR|| > contact_eps` 时视为存在接触。
-        old_eval: 保留旧挤压力定义；False 使用 (|fL_z| + |fR_z|) / 2，仅影响抓取力统计。
+        old_eval: 保留旧挤压力定义；False 使用 |fL_z| + |fR_z|，仅影响抓取力统计。
 
     Returns:
         ContactForceSeries: 包含 squeeze / external / external_norm / contact_mask。
@@ -178,11 +178,11 @@ def compute_contact_force_series_from_lr_forces(
     abs_fL_z = np.abs(fL_z)
     abs_fR_z = np.abs(fR_z)
     # Keep the shared API's historical default for non-evaluation callers.
-    # Evaluators explicitly pass old_eval=False for mean finger normal force.
+    # Evaluators explicitly pass old_eval=False for summed finger normal force.
     squeeze = (
         2.0 * np.minimum(abs_fL_z, abs_fR_z)
         if old_eval
-        else 0.5 * (abs_fL_z + abs_fR_z)
+        else abs_fL_z + abs_fR_z
     )
 
     # 加持力 x/y：直接相加
