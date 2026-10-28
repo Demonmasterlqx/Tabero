@@ -180,6 +180,27 @@ Model training code is maintained in the companion repository **[NathanWu7/Taber
 
 *F/G = Firm/Gentle prompts. SR = Success Rate. AG = Average Grip-force. See the paper for full details.*
 
+we define the mean squeeze effort as the average of the effort of the measured/predicted force in the left and right grip fingers:
+
+$$
+F_{\text{left grip finger}} = \text{the effort of measured/predicted force in the left grip finger} \\
+F_{\text{right grip finger}} = \text{the effort of measured/predicted force in the right grip finger} \\
+$$
+
+we use this formula due to it fit the real machine better.
+
+$$
+
+F_{\text {mean squeeze effort}} = \frac{F_{\text{left grip finger}} + F_{\text{right grip finger}}}{2}
+
+$$
+
+in the paper, we use this:
+
+$$
+F_{\text {mean squeeze effort}} = \min(F_{\text{left grip finger}}, F_{\text{right grip finger}}) * 2 
+$$
+
 | Model | F SR | G SR | F AG | G AG |
 | --- | ---: | ---: | ---: | ---: |
 | None | 0.00 | 0.00 | 0.0 | 0.0 |

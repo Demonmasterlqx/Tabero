@@ -34,6 +34,7 @@ from benchmarks.common.episode_metrics import (
     summarize_trajectory_force_metrics,
     validate_episode_records,
 )
+from benchmarks.common.metrics import grip_force_metric_metadata
 
 
 def _load_tabero_task_subset(workspace_root: Path) -> dict[str, list[int]]:
@@ -103,6 +104,7 @@ def _should_auto_use_tabero_tasks(hdf5_folder: Optional[Path], replayed_demos_di
 class EvaluationConfig:
     """Configuration for running task evaluations."""
 
+    old_eval: bool = False
     policy_model: str = "openpi"
     control_mode: str = "diffik"
     # OpenPI tactile 消融：透传到 openpi client 的 `--abs7d`
@@ -224,6 +226,8 @@ def build_command(
     ]
 
     if config.policy_model == "openpi":
+        if config.old_eval:
+            cmd.append("--old_eval")
         cmd.extend([
             "--control_mode", config.control_mode,
             "--replan_steps", str(config.replan_steps),
@@ -983,6 +987,7 @@ def save_success_rates_json(results: list[dict], output_file: Path, config: Eval
 
     output_data = {
         "metadata": {
+            **grip_force_metric_metadata(config.old_eval),
             "policy_model": config.policy_model,
             "control_mode": config.control_mode if config.policy_model == "openpi" else "N/A",
             "abs7d": bool(config.abs7d) if config.policy_model == "openpi" else False,
@@ -1453,6 +1458,9 @@ def save_success_rates_txt(results: list[dict], output_file: Path, config: Evalu
         f.write("=" * 60 + "\n\n")
 
         f.write("Configuration:\n")
+        grip_metadata = grip_force_metric_metadata(config.old_eval)
+        f.write(f"  old_eval: {config.old_eval}\n")
+        f.write(f"  Grip force (N): {grip_metadata['grip_force_definition']}\n")
         f.write(f"  Policy Model: {config.policy_model}\n")
         if config.policy_model == "openpi":
             f.write(f"  Control Mode: {config.control_mode}\n")
@@ -1962,6 +1970,7 @@ def resolve_step_trace_root(
 def main():
     """Main entry point."""
     config = tyro.cli(EvaluationConfig)
+    print("[Grip-Force-Eval] " + json.dumps(grip_force_metric_metadata(config.old_eval)))
     if (
         not math.isfinite(config.lift_height_threshold_m)
         or config.lift_height_threshold_m <= 0.0

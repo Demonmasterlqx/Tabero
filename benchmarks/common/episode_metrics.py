@@ -687,6 +687,7 @@ def summarize_episode_force_metrics(
     *,
     force_mode: str,
     env_steps: int,
+    old_eval: bool = True,
     actions_13d: Sequence[Any] = (),
     squeeze_pred_values: Iterable[float] = (),
     squeeze_meas_values: Iterable[float] = (),
@@ -699,6 +700,8 @@ def summarize_episode_force_metrics(
 
     ``force_mode`` is one of ``full`` (hybrid/tactile), ``measured_only``
     (binary), or ``not_applicable`` (diffik/osc).
+    The scalar squeeze sequences must already use the selected convention and
+    preserve the controller's EMA sampling. Vector-derived metrics use old_eval.
     """
 
     if force_mode not in {"full", "measured_only", "not_applicable"}:
@@ -726,13 +729,13 @@ def summarize_episode_force_metrics(
 
     pred_metrics = None
     if action_array is not None:
-        pred_metrics = compute_contact_force_metrics_from_13d(action_array)
+        pred_metrics = compute_contact_force_metrics_from_13d(action_array, old_eval=old_eval)
 
     fL_meas = _stack_lr(fL_meas_values)
     fR_meas = _stack_lr(fR_meas_values)
     meas_metrics = None
     if fL_meas is not None and fR_meas is not None and fL_meas.shape == fR_meas.shape:
-        meas_metrics = compute_contact_force_metrics_from_lr_forces(fL_meas, fR_meas)
+        meas_metrics = compute_contact_force_metrics_from_lr_forces(fL_meas, fR_meas, old_eval=old_eval)
 
     force_metrics: dict[str, float | None] = {key: None for key in FORCE_METRIC_KEYS}
     if force_mode == "full":
