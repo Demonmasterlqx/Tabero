@@ -38,6 +38,19 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 
+def grip_force_metric_metadata(old_eval: bool) -> dict[str, bool | str]:
+    """Describe the AG/AM convention independently of controller squeeze."""
+    return {
+        "old_eval": bool(old_eval),
+        "grip_force_definition": (
+            "2 * min(abs(fL_z), abs(fR_z))"
+            if old_eval
+            else "(abs(fL_z) + abs(fR_z)) / 2"
+        ),
+        "grip_force_unit": "N",
+    }
+
+
 @runtime_checkable
 class _ArrayLike(Protocol):
     """兼容 numpy / torch / list 的最小 array-like 协议."""
@@ -50,7 +63,7 @@ class _ArrayLike(Protocol):
 class ContactForceSeries:
     """逐时间步的力学量（不做任何聚合），便于后续可视化或自定义统计."""
 
-    # 每个时间步的挤压力标量 f_sq = 2 * min(|fL_z|, |fR_z|)，shape: (T,)
+    # Selected grip-force convention per step, shape: (T,).
     squeeze: np.ndarray
 
     # 每个时间步的加持力向量（兼容字段名 external），shape: (T, 3)
@@ -122,6 +135,8 @@ def compute_contact_force_series_from_lr_forces(
     fL: _ArrayLike,
     fR: _ArrayLike,
     contact_eps: float = 1e-6,
+    *,
+    old_eval: bool = True,
 ) -> ContactForceSeries:
     """基于左右指 3D 力（局部或统一坐标系）计算逐时间步的挤压力与加持力.
 
@@ -142,6 +157,7 @@ def compute_contact_force_series_from_lr_forces(
         fL: 左指力，shape: (T, 3) 或可转换为该形状的 array-like。
         fR: 右指力，shape: (T, 3) 或可转换为该形状的 array-like。
         contact_eps: 接触阈值，当 `||fL|| + ||fR|| > contact_eps` 时视为存在接触。
+        old_eval: 保留旧挤压力定义；False 使用 (|fL_z| + |fR_z|) / 2，仅影响抓取力统计。
 
     Returns:
         ContactForceSeries: 包含 squeeze / external / external_norm / contact_mask。
@@ -158,10 +174,16 @@ def compute_contact_force_series_from_lr_forces(
     fL_x, fL_y, fL_z = fL_np[:, 0], fL_np[:, 1], fL_np[:, 2]
     fR_x, fR_y, fR_z = fR_np[:, 0], fR_np[:, 1], fR_np[:, 2]
 
-    # 挤压力标量：左右指 z 轴分量绝对值的较小者（乘 2 视为两指合计）
+    # Finger normal-force magnitudes for the selected grip-force convention.
     abs_fL_z = np.abs(fL_z)
     abs_fR_z = np.abs(fR_z)
-    squeeze = 2.0 * np.minimum(abs_fL_z, abs_fR_z)  # (T,)
+    # Keep the shared API's historical default for non-evaluation callers.
+    # Evaluators explicitly pass old_eval=False for mean finger normal force.
+    squeeze = (
+        2.0 * np.minimum(abs_fL_z, abs_fR_z)
+        if old_eval
+        else 0.5 * (abs_fL_z + abs_fR_z)
+    )
 
     # 加持力 x/y：直接相加
     Fx = fL_x + fR_x
@@ -192,6 +214,8 @@ def compute_contact_force_series_from_lr_forces(
 def compute_contact_force_series_from_13d(
     actions_13d: _ArrayLike,
     contact_eps: float = 1e-6,
+    *,
+    old_eval: bool = True,
 ) -> ContactForceSeries:
     """从 13D 混合力–位动作向量直接计算逐时间步力学量.
 
@@ -201,7 +225,7 @@ def compute_contact_force_series_from_13d(
     - 任意与 `ForcePositionAction` 对齐的数据。
     """
     fL, fR = split_lr_forces_from_13d(actions_13d)
-    return compute_contact_force_series_from_lr_forces(fL, fR, contact_eps=contact_eps)
+    return compute_contact_force_series_from_lr_forces(fL, fR, contact_eps=contact_eps, old_eval=old_eval)
 
 
 # -----------------------------------------------------------------------------
@@ -308,9 +332,11 @@ def compute_topk_mean(values: _ArrayLike, frac: float = 0.05) -> float:
 def compute_contact_force_metrics_from_13d(
     actions_13d: _ArrayLike,
     contact_eps: float = 1e-6,
+    *,
+    old_eval: bool = True,
 ) -> ContactForceMetrics:
     """从 13D 动作序列直接得到挤压力 / 外力的接触统计指标."""
-    series = compute_contact_force_series_from_13d(actions_13d, contact_eps=contact_eps)
+    series = compute_contact_force_series_from_13d(actions_13d, contact_eps=contact_eps, old_eval=old_eval)
     return summarize_contact_force(series)
 
 
@@ -318,13 +344,16 @@ def compute_contact_force_metrics_from_lr_forces(
     fL: _ArrayLike,
     fR: _ArrayLike,
     contact_eps: float = 1e-6,
+    *,
+    old_eval: bool = True,
 ) -> ContactForceMetrics:
     """从左右指 3D 力序列直接得到挤压力 / 外力的接触统计指标."""
-    series = compute_contact_force_series_from_lr_forces(fL, fR, contact_eps=contact_eps)
+    series = compute_contact_force_series_from_lr_forces(fL, fR, contact_eps=contact_eps, old_eval=old_eval)
     return summarize_contact_force(series)
 
 
 __all__ = [
+    "grip_force_metric_metadata",
     "ContactForceSeries",
     "ContactForceMetrics",
     "split_lr_forces_from_13d",
@@ -335,5 +364,3 @@ __all__ = [
     "compute_contact_force_metrics_from_lr_forces",
     "compute_topk_mean",
 ]
-
-

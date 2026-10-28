@@ -52,6 +52,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from benchmarks.common.metrics import grip_force_metric_metadata
+
 # Task suite to task count mapping（原版 Libero：每个 suite 默认 10 个任务）
 TASK_SUITE_CONFIGS = {
     "libero_spatial": 10,
@@ -114,6 +116,8 @@ def get_task_name_and_instruction(task_suite: str, task_id: int, config_path: Pa
 @dataclass
 class DataReplayEvalConfig:
     """Configuration for data replay evaluation."""
+
+    old_eval: bool = False
     
     # Task selection
     task_suites: tuple[str, ...] = ()  # Specific task suites to evaluate (empty = all suites)
@@ -242,6 +246,8 @@ def run_single_replay_evaluation(
         "--num_envs", str(config.num_envs),
         "--enable_cameras",
     ]
+    if config.old_eval:
+        cmd.append("--old_eval")
     
     # Always use replayed_demos (task-space) for this evaluation path (provided via env in parent process).
     
@@ -393,6 +399,7 @@ def run_single_replay_evaluation(
         
         # Prepare result
         result = {
+            **grip_force_metric_metadata(config.old_eval),
             "task_suite": task_suite,
             "task_id": task_id,
             "task_name": task_name,
@@ -464,6 +471,7 @@ def save_results(results: list[dict], config: DataReplayEvalConfig):
             json.dump({
                 "timestamp": timestamp,
                 "config": {
+                    **grip_force_metric_metadata(config.old_eval),
                     "data_type": data_type,
                     "REPLAYED_DEMOS_DIR": demos_dir_str,
                     "task_env": config.task,
@@ -484,6 +492,9 @@ def save_results(results: list[dict], config: DataReplayEvalConfig):
             f.write(f"Timestamp: {timestamp}\n")
             f.write(f"Data Type: {data_type}\n")
             f.write(f"Environment: {config.task}\n")
+            grip_metadata = grip_force_metric_metadata(config.old_eval)
+            f.write(f"old_eval: {config.old_eval}\n")
+            f.write(f"Grip force (N): {grip_metadata['grip_force_definition']}\n")
             f.write("="*80 + "\n\n")
             
             # Write individual results
@@ -789,6 +800,7 @@ def main():
     
     # Parse configuration
     config = tyro.cli(DataReplayEvalConfig)
+    print("[Grip-Force-Eval] " + json.dumps(grip_force_metric_metadata(config.old_eval)))
 
     # 根据 control_mode 与 task 关键字做环境选择（与 OpenPI / run_task_evaluations 保持一致）
     if not config.task:
