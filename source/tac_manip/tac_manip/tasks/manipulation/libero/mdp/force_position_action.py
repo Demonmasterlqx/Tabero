@@ -192,8 +192,8 @@ class ForcePositionAction(ActionTerm):
 
         # 实测挤压力 EMA 滤波状态（标量）
         self._f_sq_meas_ema = torch.zeros(self.num_envs, device=self._device)
-        # Evaluation-only mean finger force, sampled at the same physics cadence.
-        self._f_grip_mean_meas_ema = torch.zeros(self.num_envs, device=self._device)
+        # Evaluation-only summed finger force, sampled at the same physics cadence.
+        self._f_grip_sum_meas_ema = torch.zeros(self.num_envs, device=self._device)
         self._f_sq_meas_ema_initialized = False
 
         # Per-environment state for the first-contact latch.  The step counter
@@ -264,7 +264,7 @@ class ForcePositionAction(ActionTerm):
         self._raw_actions[ids] = 0.0
         self._processed_actions[ids] = 0.0
         self._f_sq_meas_ema[ids] = 0.0
-        self._f_grip_mean_meas_ema[ids] = 0.0
+        self._f_grip_sum_meas_ema[ids] = 0.0
         # EMA initialization is currently shared by all environments; forcing
         # reinitialization is safe for partial resets and avoids stale force.
         self._f_sq_meas_ema_initialized = False
@@ -424,8 +424,8 @@ class ForcePositionAction(ActionTerm):
             self._fL_target_local, self._fR_target_local
         )
         # Diagnostic scalars only: control and damage still use two-finger squeeze.
-        f_grip_mean_raw = 0.5 * (fL_meas_local[:, 2].abs() + fR_meas_local[:, 2].abs())
-        f_grip_mean_pred = 0.5 * (
+        f_grip_sum_raw = fL_meas_local[:, 2].abs() + fR_meas_local[:, 2].abs()
+        f_grip_sum_pred = (
             self._fL_target_local[:, 2].abs() + self._fR_target_local[:, 2].abs()
         )
 
@@ -434,16 +434,16 @@ class ForcePositionAction(ActionTerm):
         if 0.0 < alpha < 1.0:
             if not self._f_sq_meas_ema_initialized:
                 self._f_sq_meas_ema[:] = f_sq_meas_raw
-                self._f_grip_mean_meas_ema[:] = f_grip_mean_raw
+                self._f_grip_sum_meas_ema[:] = f_grip_sum_raw
                 self._f_sq_meas_ema_initialized = True
             else:
                 self._f_sq_meas_ema.mul_(1.0 - alpha).add_(f_sq_meas_raw, alpha=alpha)
-                self._f_grip_mean_meas_ema.mul_(1.0 - alpha).add_(f_grip_mean_raw, alpha=alpha)
+                self._f_grip_sum_meas_ema.mul_(1.0 - alpha).add_(f_grip_sum_raw, alpha=alpha)
             f_sq_meas = self._f_sq_meas_ema
-            f_grip_mean_meas = self._f_grip_mean_meas_ema
+            f_grip_sum_meas = self._f_grip_sum_meas_ema
         else:
             f_sq_meas = f_sq_meas_raw
-            f_grip_mean_meas = f_grip_mean_raw
+            f_grip_sum_meas = f_grip_sum_raw
 
         # squeeze 目标前馈补偿（用于防滑/随负载增压）：基于 applied force 的 z 轴净载荷
         f_sq_target_eff = f_sq_target
@@ -598,8 +598,8 @@ class ForcePositionAction(ActionTerm):
             "f_sq_meas": f_sq_meas.detach().clone(),
             "f_sq_meas_raw": f_sq_meas_raw.detach().clone(),
             "f_sq_pred_eff": f_sq_target_eff.detach().clone(),
-            "f_grip_mean_pred": f_grip_mean_pred.detach().clone(),
-            "f_grip_mean_meas": f_grip_mean_meas.detach().clone(),
+            "f_grip_sum_pred": f_grip_sum_pred.detach().clone(),
+            "f_grip_sum_meas": f_grip_sum_meas.detach().clone(),
             "target_contact_override_enabled": torch.full_like(
                 self._target_contact_detected,
                 self.cfg.target_contact_squeeze_enabled,

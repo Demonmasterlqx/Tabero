@@ -191,7 +191,7 @@ we use this formula due to it fit the real machine better.
 
 $$
 
-F_{\text {mean squeeze effort}} = \frac{F_{\text{left grip finger}} + F_{\text{right grip finger}}}{2}
+F_{\text {mean squeeze effort}} = F_{\text{left grip finger}} + F_{\text{right grip finger}}
 
 $$
 

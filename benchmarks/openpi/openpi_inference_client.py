@@ -1277,14 +1277,14 @@ def run_closed_loop_policy(  # noqa: C901
                             if debug.get("f_sq_pred") is not None:
                                 step_squeeze_pred = _finite_float_or_none(debug["f_sq_pred"])
                                 step_grip_eval_pred = _finite_float_or_none(
-                                    debug.get("f_sq_pred" if args.old_eval else "f_grip_mean_pred")
+                                    debug.get("f_sq_pred" if args.old_eval else "f_grip_sum_pred")
                                 )
                                 if step_grip_eval_pred is not None:
                                     exp_fsq_pred_values.append(step_grip_eval_pred)
                             if debug.get("f_sq_meas") is not None:
                                 step_squeeze_meas = _finite_float_or_none(debug["f_sq_meas"])
                                 step_grip_eval_meas = _finite_float_or_none(
-                                    debug.get("f_sq_meas" if args.old_eval else "f_grip_mean_meas")
+                                    debug.get("f_sq_meas" if args.old_eval else "f_grip_sum_meas")
                                 )
                                 if step_grip_eval_meas is not None:
                                     exp_fsq_meas_values.append(step_grip_eval_meas)
